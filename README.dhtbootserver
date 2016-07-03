@@ -1,0 +1,27 @@
+This is a simple DHT boot server based on dht-d. In essence, it uses the dht-d
+core functionality (class DHT) by deriving a class DHTBootserver, which changes
+core behaviour to:
+
+ - one huge bucket per protocol to store mature nodes with any ID
+ - A node is considered "mature" above a certain age (this should be at least 15
+   minutes to allow newly booted nodes to accumulate a proper routing table)
+ - The boot server will not react to message traffic initiated by mature nodes;
+   ideally, this results in mature nodes removing the boot server from their
+   routing tables, thus reducing traffic.
+ - When queried with find_node or get_peers queries, the boot server returns 
+   8 mature nodes without considering proximity to the queried info_hash or ID. 
+   This is done by sequentially traversing through the set of mature nodes.
+   Non-mature nodes are not returned, unless there is no mature node in 
+   the entire bucket. Nodes which are not good are never returned.
+ - The boot server ignores announce peer messages; it will never store 
+   peer information. 
+ - The routing tables are kept updated by traversing and pinging nodes;
+   if the routing tables filled below a configurable threshold (default: 90%),
+   a find_node query with a random ID is used instead to fill the bucket.
+ - Stale, "bad" nodes are only removed by the expire_buckets recurring job;
+   the ping count threshold above by which a node is considered stale 
+   depends on the age of the node, ranging from 2 pings from very young nodes,
+   upto 7 pings for nodes older than one day.
+ - Every 10 minutes, the boot server launches a search for a random infohash
+   to fill its buckets beyond 90%
+ - All Sybil attack protection mechanisms of dht-d are active.

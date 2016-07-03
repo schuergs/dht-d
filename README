@@ -1,0 +1,180 @@
+This is a D implementation of the Kademlia Distributed Hash Table (DHT) used in
+the Bittorrent network ("mainline"). It is based on, and would not have been
+possible without, jech/dht.
+
+dht_example.d is a little standalone DHT client, which shows basic functionality
+like initialising, booting, searching.
+
+Similar to jech/dht, the core interface is the method DHT.periodic, which must
+be called periodically and when UDP data is received. It handles incoming data
+and performs periodic tasks to keep the DHT alive.
+
+dht-d has additional mechanisms to protect your routing tables from Sybil
+attacks (see https://en.wikipedia.org/wiki/Sybil_attack); more on this below.
+
+dht-d is highly configurable; all settings which are not defined by the mainline
+protocol can be changed in DHT.globals, such as bucket and cache size, timeouts,
+expiration, maintenance frequency, etc.
+
+
+Initialisation
+--------------
+
+* DHT.this
+
+The constructor requires a bound IPv4 datagram socket, a bound IPv6 datagram
+socket, and your node ID (20 bytes, should be globally unique). In addition, you
+need to pass a callback function or delegate, which will be called when search
+hits occur, or a search is completed.
+
+Make sure to bind each of your sockets to just one address in case of a multi-
+address system.
+
+In order to be well-distributed, node IDs need to be crated using a good random
+function, or the SHA-1 hash of something. The ID should stay the same across
+sessions, so it's a good idea to store it somewhere for later re-use.
+
+Bootstrapping
+-------------
+
+Booting the DHT needs at least one known node (IP+port). It's a good idea to
+store the most stable nodes before exiting the clients, so you can re-use them
+later.
+
+* DHTNode.send_ping
+
+The boot primitive, just requiring a Socket and an Address. If the targetted
+address replies, the node is inserted into the routing table and your DHT
+buckets will slowly start to fill.
+
+* DHT.boot_search
+
+A fast way to fill your routing tables, once you have at least one good node via
+send_ping. The search for an ID close to your own will quickly fill your tables,
+typically taking about five seconds.
+
+* DHTNode.insert_node
+
+A more gentle way to boot your DHT, re-creating your routing tables from a 
+previously saved set of nodes. insert_node will eagerly split buckets,
+so you can re-create the routing tables in one step, without a delay between
+node inserts. insert_node either accepts a pair of DHTId/Address, or an array
+of NodeInfo, which is a wrapper for a DHTId/Address combination. 
+Newly inserted nodes are seen as dubious, and the containing bucket is set
+to old, so the bucket is flagged for immediate maintenance, and the 
+inserted nodes are pinged as soon as any new node is checked for insert
+into the respective bucket.
+
+
+Running the mainline DHT 
+------------------------
+
+* DHT.periodic
+
+Your loop should call this method periodically, and whenever the socket or
+sockets have data. The method returns the time period after which it should be
+called again for maintenance work, using a null buffer and a null address.
+
+* DHT.new_search
+
+This triggers a search for the given infohash ID. If also supplying a non-zero
+port, the search will also result in an announce for the ID. The port supplied
+is the port number you client is listening on.
+
+In both cases the callback is invoked as soon as the search finds additional
+peers; the same peer won't be reported twice. See DHT.CallbackType for the
+various statuses the callback will receive.
+
+Querying DHT status
+-------------------
+
+* DHT.num_nodes
+
+Returns the number of good, dubious and cached nodes, as well as received messages;
+the number of nodes is a good indication if the client can start a search, and the
+number of received messages indicates if a firewall is blocking incoming requests.
+
+* DHT.get_nodes
+
+Returns an array of routing table nodes. This method can be used to save the routing
+table at regular intervals, or at client exit. Starting from the deepest bucket 
+(containing the client ID), it will walk up the adjourning buckets left and
+right, returning a defineable number of good nodes per bucket. The size of 
+the result array can be limited.
+
+
+* DHT.toString
+
+Debugging aid to display the DHT buckets, ongoing searches, blacklists, etc. You
+also may want to modify the log level by disabling or enabling the lower log levels during compilation 
+(e.g., version=StdLoggerDisableTrace). Alternatively, you can also set the log
+level via globalLogLevel. Compiling the client with version=statistics gives you
+additional insights, such as the number messages and bytes sent and received,
+as well as a deeper peek at the blacklists.
+
+
+Additional protection against Sybil attacks
+-------------------------------------------
+
+The IPv4 mainline DHT is heavily polluted by a relatively small number of
+malicious Sybil clients. They show three patterns of malicious behaviour: 
+
+1. Sending messages with your client's ID 
+This is easy to detect and should only affect very simple clients. jech/dht also
+checks for this behaviour.
+
+2. "Honeypot" 
+A smarter variant of #1: A malicious client replies with an ID very close to
+your own ID. This likely pollutes your deepest bucket and can break incoming
+searches in your ID's proximity by cluttering the querying node's
+search bucket with dead addresses. 
+
+3. ID changes  
+A malicious client sends queries or responses using a multitude of IDs. This
+pollutes your routing tables and can break searches. A typical behaviour is to
+answer to a get_peers query with an ID closer to the desired infohash, pushing
+honest nodes out of your search bucket. Another motivation could be tracking of
+get_peers or announce queries for certain infohashes.
+
+Defence mechanisms:
+* Blacklisting: 
+Behaviour #1 and #2 are clearly malicious and result in a blacklist entry for
+the IP address, independent of the port used by the malicious node. Incoming
+messages are checked against the blacklist; so are peer lists returned by
+find_node and get_peers. When a new blacklist entry is created, all nodes from
+the blacklisted IP are removed from the routing table and ongoing searches.
+Blacklist entries have a timestamp of the last malicious activity and will be
+removed if no such activity is observed for a certain time (configurable). There
+is no size limit for the blacklist.
+
+* IPv6 and multi-stack blacklist enhancements: 
+For Teredo (2001:0::/32) and 6to4 (2002::/16) addresses, all address bytes but
+the prefix and the embedded IPv4 address are zeroed when comparing for
+blacklisting. When a blacklist entry for an IPv4, Teredo or 6to4 address is
+created and both IPv4 and IPv6 are active, the entry is cloned for the other two
+equivalent addresses (see DHT.is_sybil).
+
+* Detecting ID changes:
+dht-d tracks seen node addresses (IP+port) and stores the associated ID. Entries
+not seen for some time are removed. Once a client with a certain address claims
+to have a different ID, the address is added to the Sybil watchlist. ID changes
+are not necessarily malicious behaviour - a poorly written client may change its
+ID every time it starts, or a different client may occupy the same address/port
+combination due to NATing. The Sybil watchlist will tolerate different IDs for
+the same address up to a configurable threshold (default: 3). Only if the
+threshold is exceeded, the address is blacklisted. 
+
+Final remarks
+-------------
+
+The code is still very "C-ish" and monolithic due to performance reasons. 
+
+Although the code has been tested in several multi-day test runs with random
+searches performed at five-sencond intervals, it has not been stress tested
+with a non-consumer, high-bandwidth internet connection. If you have such
+a conenction available, it would be great if you could perform a stress test
+and give me result feedback.
+
+           Stefan Schuerger
+	   stefan (at) schuerger.com
+
