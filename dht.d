@@ -78,14 +78,14 @@ class DHT {
         uint bucket_max_num = 30;                           // The maximum depth of our routing table
         uint bucket_cache_size = 8;                         // Size of each bucket's cache
         uint junk_honeypot_bits = 31;                       // Number of common bits for detecting a "honeypot" peer
-        uint junk_seen_addresses_max_age = 900;             // Expire seen entries
-        uint junk_blacklist_addresses_max_age = 900;        // Expire blacklisted entries
+        uint junk_seen_addresses_max_age = 3600;            // Expire seen entries
+        uint junk_blacklist_addresses_max_age = 3600;       // Expire blacklisted entries
         uint save_top_n = 4;                                // Oldest n nodes per bucket to save
         uint search_expiry = 900;                           // Delete a search
         uint search_bucket_size = 14;                       // Max number of results carried forward
         uint search_bucket_relevant = 8;                    // Max number of results considered
         uint search_parallel_queries = 3;                   // Number of queries in parallel
-        uint search_max_ping_time = 15;                     // Wait before next ping
+        uint search_max_ping_time = 2;                      // Wait before next ping
         uint search_boot_bucket_min = 4;                    // Min fill of bucket in boot search
         uint scheduler_expire_buckets = 60;                 // Service job to expire bucket entries
         uint scheduler_expire_storage = 60;                 // Service job to expire storage
@@ -528,7 +528,7 @@ class DHT {
     
     // Insert a a previously saved nodes into your routing tables,
     // eagerly splitting buckets.
-    public DHTNode insert_node(DHTId id, Address address){
+    public DHTNode insert_node(DHTId id, Address address, bool eager_split=false){
 	DHTInfo* pinfo;
 
 	// This is necessary, as some functions as getAddress() return
@@ -552,6 +552,17 @@ class DHT {
  
 	    
 	DHTBucket bucket = find_bucket(pinfo,id);
+	if(eager_split) // Special case - split faster, using save_top_n - This is for initial loading of buckets
+	    while(bucket.nodes.num >= globals.save_top_n){
+	        if(bucket is pinfo.my_bucket)
+	            pinfo.my_bucket.split();
+	        else // other bucket is full - shouldn't happen
+	    	    break;
+	        
+	        bucket = find_bucket(pinfo,id);
+	    }
+	
+	
 	while(bucket.nodes.num >= globals.bucket_size){
 	    if(bucket is pinfo.my_bucket)
 	        pinfo.my_bucket.split();
@@ -869,8 +880,9 @@ class DHT {
 
             char* ptr = cast(char*)&found[nlen];
             char* endptr;
-            long fieldlen;
-            fieldlen = strtol(ptr, &endptr, 10);
+            //long fieldlen;
+            uint fieldlen;
+            fieldlen = cast(uint)(strtol(ptr, &endptr, 10));
             if (!endptr)
                 throw new Exception("broken message");
 
@@ -878,6 +890,7 @@ class DHT {
             if (nlen + lenlen + fieldlen > (found.length - 2))
                 throw new Exception("broken message");
 
+            //whereto = found[(nlen + lenlen + 1) .. (nlen + lenlen + fieldlen + 1)].dup;
             whereto = found[(nlen + lenlen + 1) .. (nlen + lenlen + fieldlen + 1)].dup;
             return true;
         }
@@ -897,11 +910,12 @@ class DHT {
 
             while (1) {
                 char* endptr;
-                long fieldlen;
-                fieldlen = strtol(cast(char*) found.ptr, &endptr, 10);
+                uint fieldlen;
+                fieldlen = cast(uint) strtol(cast(char*) found.ptr, &endptr, 10);
 
                 if (endptr && *endptr == ':' && fieldlen > 0) {
-                    auto lenlen = endptr - cast(char*) found.ptr;
+                    //auto lenlen = endptr - cast(char*) found.ptr;
+                    uint lenlen = cast(uint)(endptr - cast(char*) found.ptr);
                     if (lenlen + fieldlen > (found.length - 2))
                         throw new Exception("broken message");
 
@@ -1527,7 +1541,7 @@ class DHT {
 
     // Search step #2: Add new results to search bucket, keeping the top n nodes
     protected void search_step2(DHTInfo* pinfo, Search* s, ubyte[] nodes_blob,
-        ubyte results_blob[], uint howmany = 1) {
+        ubyte[] results_blob, uint howmany = 1) {
         if (s.status == s.status.done && !s.is_boot_search)
             return;
 
