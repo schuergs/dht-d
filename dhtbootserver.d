@@ -49,7 +49,7 @@ class DHTBootserver : DHT {
         uint scheduler_expire_buckets = 60;                 // Service job to expire bucket entries
         uint scheduler_ping_walker = 5;                     // Walk forward and ping
         uint scheduler_random_search = 600;                 // Start a random search to gather nodes
-	uint well_filled_percentage = 90;                   // well-filled watermark
+	uint well_filled_percentage = 95;                   // well-filled watermark
     };
 
     public static immutable globals_bs_t globals_bs;
@@ -97,7 +97,7 @@ class DHTBootserver : DHT {
 	globals.bucket_cache_size     = globals_bs.bucket_cache_size;
 	globals.bucket_max_num        = globals_bs.bucket_max_num;
 	
-        super(myID, sock4, sock6,(tp,id,ad){});
+        super(myID, myID, sock4, sock6,(tp,id,ad){});
 
         ping_walker4 = PingWalker4(&info.buckets.first.nodes);
         ping_walker6 = PingWalker6(&info6.buckets.first.nodes);
@@ -261,6 +261,10 @@ class DHTBootserver : DHT {
             fLog.trace("Non-implemented message type: ", wm.message);
         }
 
+	// Perform check of our own IP
+	if(wm.own_ip.length > 0)
+	    ip_check(pinfo,wm.own_ip);
+
     }
 
 
@@ -278,8 +282,11 @@ class DHTBootserver : DHT {
                     node.last_pinged = 0;
                     node.ping_count = 0;
                     node.bucket.age = now;
+                    node.last_seen = now;
+		    break;
                 case node.Reliability.sent:
                     node.last_seen = now;
+		    break;
 		default:
             }
             fLog.trace("is known");
@@ -294,6 +301,20 @@ class DHTBootserver : DHT {
 	if(rel == DHTNode.Reliability.sent && (pinfo.is_v6 ? well_filled6 : well_filled4))
 	    return;
 	
+        bool id_matches_ip;
+	bool id_match_checked = false;
+	
+	// see if we may insert this node at all
+	if(bucket.locked_for_good_ids){
+	    id_matches_ip = is_id_by_ip(id,to_blob(from));
+	    if(!id_matches_ip){
+	        fLog.trace("Won't store bad node in locked bucket");
+		return;
+	    } 
+	    id_match_checked = true;
+	}
+	
+	
         if (bucket.nodes.num >= globals.bucket_size) {
             if (rel != DHTNode.Reliability.dubious) {
                 bucket.store_cache(from);
@@ -304,7 +325,7 @@ class DHTBootserver : DHT {
         }
 
         /* Create new node */
-        DHTNode this_node = new DHTNode(id, from, bucket);
+        DHTNode this_node = new DHTNode(id, from, bucket,id_match_checked,id_matches_ip);
         this_node.last_seen = rel == DHTNode.Reliability.dubious ? 0 : now;
         this_node.last_replied = rel == DHTNode.Reliability.replied ? now : 0;
         pinfo.bucket_nodes[id] = this_node;
@@ -318,26 +339,20 @@ class DHTBootserver : DHT {
     // from the cache instead.
     override void expire_buckets(DHTInfo* pinfo) {
         uint removed_nodes=0;
+	DHTNode nextnode;
 	for (auto bucket = pinfo.buckets.first; bucket !is null; bucket = bucket.next)
-            // move backwards here to avoid walkers being pushed forward
-	    // several times
-	    for (auto node = bucket.nodes.last; node !is null; node = node.prev)
+	    for (auto node = bucket.nodes.first; node !is null; node = nextnode){
+	        nextnode = node.next;
                 if (node.ping_count > ping_count_threshold(node.first_seen)) {
-		    if(pinfo.is_v6){
-		        ping_walker6.flag_deleted(node);
-		        collector6.flag_deleted(node);
-		    } else {
-		        ping_walker4.flag_deleted(node);
-		        collector4.flag_deleted(node);
-		    }
                     bucket.nodes.remove(node);
                     bucket.send_cached_ping();
                     pinfo.bucket_nodes.remove(node.id);
 		    ++removed_nodes;
                 }
+	    }
 	
         if(removed_nodes > 0)	
-	    fLog.info("Expired ",removed_nodes," ",pinfo.is_v6 ? "IPv6" : "IPv4", " nodes");	
+	    fLog.info("Expired ",removed_nodes," ",pinfo.is_v6 ? "IPv6" : "IPv4", " nodes.");	
 		
         // Adjust watermark
 	pinfo.is_v6 ? well_filled6 : well_filled4 = ((100 * pinfo.buckets.first.nodes.num ) / globals.bucket_size) >= globals_bs.well_filled_percentage;
@@ -379,7 +394,7 @@ bool is_mature(DHTNode node){
 }
  
 // 
-// Walks forward through a DoubleList of T until an element is found which fulfils a condition,
+// Walks forward through a DoubleList of T until an element is found which fulfills a condition,
 // then performs an action. Condition is optional. If a given reset condition (optional)
 // is fulfilled, reset the walker to the start of the list.
 struct Walker(T, alias action, alias condition = "true", alias reset = "false"){
@@ -414,7 +429,9 @@ struct Walker(T, alias action, alias condition = "true", alias reset = "false"){
 	// now points to an element fulfilling the reset condition,
 	// reset cursor to avoid endless loop
 
-	if(cursor !is null && reset_f(cursor)) 
+	
+	if(cursor !is null && 
+	    (reset_f(cursor) || (cursor.next is null && cursor.prev is null && list.num > 0)))
 	    cursor = null;
 	    
         TP at_start = cursor;
@@ -487,7 +504,8 @@ struct Collector(T, U, alias collectf, alias condition = "true", alias reset = "
 	// If the list has changed between two walks, so that the cursor
 	// now points to an element fulfilling the reset condition,
 	// reset cursor to avoid endless loop
-	if(cursor !is null && reset_f(cursor)) 
+	if(cursor !is null && 
+	    (reset_f(cursor) || (cursor.next is null && cursor.prev is null && list.num > 0)))
 	    cursor = null;
 	    
         TP at_start = cursor;

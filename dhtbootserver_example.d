@@ -37,6 +37,7 @@ import std.algorithm;
 import std.experimental.logger;
 import core.stdc.time;
 import core.stdc.signal;
+import core.sys.posix.signal; // For SIGUSR1 / SIGUSR2
 import core.sys.posix.netinet.in_;
 
 import dht;
@@ -61,9 +62,11 @@ int main(string[] args){
                 flag_buckets = false,
 		flag_exit    = false;
     
-    signal(2,(dummy){flag_exit = true; });
-    signal(10,(dummy){flag_buckets = true; });
-    signal(12,(dummy){flag_search = true; });
+    signal(SIGINT, (dummy){flag_exit = true; });
+    signal(SIGTERM,(dummy){flag_exit = true; });
+    signal(SIGHUP, (dummy){flag_exit = true; });
+    signal(SIGUSR1,(dummy){flag_buckets = true; });
+    signal(SIGUSR2,(dummy){flag_search = true; });
     
     auto helpInformation = getopt(
     args,
@@ -136,7 +139,7 @@ int main(string[] args){
     
     while(args.length > 0){
         Address target;
-        try target = getAddress(args[0],to!ushort(args[1]))[0];
+        try target = getAddress(args[0],to!ushort(args[1]))[0].to_subtype();
 	catch(Exception e){
 	    stderr.writeln("'",args[0],"' + '", args[1],"' is not a valid address/port combination");
 	    return 99;
@@ -205,6 +208,7 @@ int main(string[] args){
             fLog.critical(dht);
 	    lastshow = dht.now;
 	    flag_buckets = false;
+	    save(dht,nodes_filename);
 	}
 	
 	if(flag_exit){
@@ -221,7 +225,8 @@ int main(string[] args){
 static void load(DHTBootserver dht,string fname){
     auto f = File(fname,"rb");
     
-    dht.myid = DHTId(f.readln().chomp);
+    dht.info.myid = DHTId(f.readln().chomp);
+    dht.info6.myid = DHTId(f.readln().chomp);
     string idline, addressline, portline;
     while((idline = f.readln()) !is null){
     
@@ -251,8 +256,9 @@ static void load(DHTBootserver dht,string fname){
 static void save(DHTBootserver dht, string fname){
     auto f = File(fname,"wb");
     
-    f.writeln(dht.myid);
-    foreach(node; dht.get_nodes(256,256,(n){return n.is_mature;})){
+    f.writeln(dht.info.myid);
+    f.writeln(dht.info6.myid);
+    foreach(node; dht.get_nodes(DHT.want,9999,9999,(n){return n.is_mature;})){
         f.writeln(node.id);
         f.writeln(node.address.toAddrString());
         f.writeln(node.address.toPortString());

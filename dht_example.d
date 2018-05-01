@@ -1,7 +1,7 @@
 /**
  * dht_example: Example mini application using dht-d
  *
- * Copyright (c) 2016 Stefan Schuerger
+ * Copyright (c) 2016-2018 Stefan Schuerger
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -39,17 +39,20 @@ import core.stdc.time;
 import core.stdc.signal;
 import core.sys.posix.signal; // For SIGUSR1 / SIGUSR2
 import core.sys.posix.netinet.in_;
+import core.thread;
 
 import dht;
 
 static string nodes_filename = "nodes.sav";
+static string nodes6_filename = "nodes6.sav";
 static string search_filename = "search.txt";
+
+bool ipv4wanted = false;
+bool ipv6wanted = false;
 
 
 int main(string[] args){
     bool quiet = false;
-    bool ipv4wanted = false;
-    bool ipv6wanted = false;
     bool verbose    = false;
     bool do_search  = false;
     bool do_boot_search = false;
@@ -59,8 +62,8 @@ int main(string[] args){
     ushort print_buckets = print_buckets_default;
     ushort myport;
     
-	// Signal handling: save nodes before exiting; 
-	// USR1 triggers bucket status dump
+	// Signal handling: save nodes before exiting (HUP, INT, TERM); 
+	// USR1 triggers bucket status dump and nodes save
 	// USR2 triggers a search
     static bool flag_search  = false,
                 flag_buckets = false,
@@ -120,7 +123,7 @@ int main(string[] args){
        
     DHTId my_id = DHTId(cast(ubyte[]) hexString!"21cb18b8297ad2517fb2ab4ee3b2c165c7b764a5");
     my_id = DHTId.random;
-    
+    my_id.id32[0] ^= getpid();
     
     Socket s=null,s6=null;	
     if(ipv4wanted){
@@ -135,20 +138,19 @@ int main(string[] args){
         s6.bind(new Internet6Address(myport));
     }
     
-    DHT dht = new DHT(my_id,s,s6,(tp,id,ad){ 
+    DHT dht = new DHT(my_id,my_id,s,s6,(tp,id,ad){ 
 	writeln("Callback for ", id, ": ",tp,"[",ad.length ,"]");
 	writeln(ad.map!(to!string).array.join(", "));
     });
     fLog.info("My ID: " ~ my_id.toString);
 
-    if(exists(nodes_filename) && isFile(nodes_filename))
-        load(dht,nodes_filename);
+    if(load(dht)) {}
     else if(args.length < 2)
         goto args_broken;
     
     while(args.length > 0){
         Address target;
-        try target = getAddress(args[0],to!ushort(args[1]))[0];
+        try target = getAddress(args[0],to!ushort(args[1]))[0].to_subtype();
 	catch(Exception e){
 	    stderr.writeln("'",args[0],"' + '", args[1],"' is not a valid address/port combination");
 	    return 99;
@@ -217,7 +219,7 @@ int main(string[] args){
             fLog.critical(dht);
 	    lastshow = dht.now;
 	    flag_buckets = false;
-            save(dht,nodes_filename);
+            save(dht);
 	}
 	
 	if(flag_exit){
@@ -231,15 +233,41 @@ int main(string[] args){
 	
     } 
 
-    save(dht,nodes_filename);
+    save(dht);
     
     return 0;
 }
 
-static void load(DHT dht,string fname){
+
+static bool load(DHT dht){
+    bool loaded_something = false;
+    if(ipv4wanted && exists(nodes_filename)  && isFile(nodes_filename)){
+        load(dht,nodes_filename,false);
+	loaded_something = true;
+    }
+    if(ipv6wanted && exists(nodes6_filename)  && isFile(nodes6_filename)){
+        load(dht,nodes6_filename,true);
+	loaded_something = true;
+    }
+    dht.id_check();
+    return loaded_something;
+}	
+
+static void load(DHT dht,string fname,bool isv6){
     auto f = File(fname,"rb");
+
+    DHT.DHTInfo* pinfo = (isv6 ? &dht.info6 : &dht.info);
     
-    dht.myid = DHTId(f.readln().chomp);
+    pinfo.myid = DHTId(f.readln().chomp);               // Line 1: ID
+    pinfo.own_ip = parseAddress(f.readln().chomp).to_subtype().to_blob(); // Lin2 2: Address
+    
+    // remove port part
+    if(pinfo.own_ip.length == 6)
+        pinfo.own_ip = pinfo.own_ip[0..4]; 
+    else if(pinfo.own_ip.length == 18)
+        pinfo.own_ip = pinfo.own_ip[0..16];
+    
+    
     string idline, addressline, portline;
     while((idline = f.readln()) !is null){
     
@@ -259,24 +287,51 @@ static void load(DHT dht,string fname){
         fLog.trace("Loading ", idline, " ", addressline, ":", portline); stdout.flush;
 	    
 	DHTId id = DHTId(idline);
-	Address address = parseAddress(addressline,to!ushort(portline));
+	Address address = parseAddress(addressline,to!ushort(portline)).to_subtype();
         dht.insert_node(id,address,true);
     }
 }
 
-static void save(DHT dht, string fname){
-    auto f = File(fname,"wb");
+static void save(DHT dht){
+    if(ipv4wanted)
+        save(dht,nodes_filename,false);
+    if(ipv6wanted)
+        save(dht,nodes6_filename,true);
+}    
+
+
+static void save(DHT dht, string fname,bool isv6){
+    auto f = File(fname ~ ".tmp","wb");
     
-    f.writeln(dht.myid);
-    foreach(node; dht.get_nodes()){
+    DHT.DHTInfo* pinfo = (isv6 ? &dht.info6 : &dht.info);
+    Address address = to_address(pinfo.own_ip);
+    
+    f.writeln(pinfo.myid);
+    f.writeln(address.toAddrString());
+    
+    foreach(node; dht.get_nodes(isv6 ? DHTProtocol.want6 : DHTProtocol.want4)){
         f.writeln(node.id);
         f.writeln(node.address.toAddrString());
         f.writeln(node.address.toPortString());
     }
+    f.flush();
+    f.close();
+    try
+        rename(fname ~ ".tmp",fname);    
+    catch(Exception e) 
+        fLog.warning("rename failed: \n", e);
 }
 
 static void load_searches(DHT dht,string fname){
-    auto f = File(fname,"rb");
+    File f;
+    try{
+        rename(fname,fname ~ ".inprogress");
+        f = File(fname ~ ".inprogress","rb");
+    }
+    catch(Exception e){ 
+        fLog.warning("open failed: \n", e);
+	return;
+    }
     
     string idline;
     while((idline = f.readln()) !is null){
@@ -285,7 +340,7 @@ static void load_searches(DHT dht,string fname){
 	dht.new_search(id);
     }
     f.close();
-    rename(fname,fname ~ ".done");
+    rename(fname ~ ".inprogress",fname ~ ".done");
 }
 
 

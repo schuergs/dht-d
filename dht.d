@@ -1,7 +1,7 @@
 /**
  * dht-d: Distributed hash table (DHT) for "mainline" DHT 
  *
- * Copyright (c) 2016 Stefan Schuerger
+ * Copyright (c) 2016-2018 Stefan Schuerger
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -35,16 +35,18 @@ import std.format               : formattedWrite, formattedRead;
 import std.string               : representation, sformat;
 import std.conv                 : hexString, to;
 import std.array                : array, appender, join;
-import std.ascii                : isPrintable;
+import std.ascii                : isPrintable, isDigit;
 import std.algorithm            : sort, find, topN, min, max, map;
 import std.random               : uniform;
 import std.experimental.logger  : Logger, FileLogger;
 import std.digest.md            : MD5;
+import std.digest.crc;
 import core.stdc.time           : time, time_t;
 import core.stdc.stdlib         : strtol;
 import core.stdc.string         : memcmp;
 import core.sys.posix.arpa.inet : htons, htonl, ntohs, ntohl;
 import core.sys.posix.netinet.in_ : sockaddr_in, sockaddr_in6; 
+
 
 static Logger fLog;
 
@@ -52,12 +54,13 @@ static Logger fLog;
 //version = warnBlacklist;
 
 enum DHTMessageType : short {
-    error         = 0,
-    reply         = 1,
-    ping          = 2,
-    find_node     = 3,
-    get_peers     = 4,
-    announce_peer = 5,
+    unknown       = 0,
+    error         = 1,
+    reply         = 2,
+    ping          = 3,
+    find_node     = 4,
+    get_peers     = 5,
+    announce_peer = 6,
 }
 
 enum DHTProtocol : short {
@@ -75,8 +78,10 @@ class DHT {
         uint bucket_max_ping_count = 3;                     // Considered "dead" after n unsuccessful pings
         uint bucket_max_ping_time = 15;                     // Time between pings
         uint bucket_max_age = 600;                          // How old may a bucket become before bucket maintenance?
-        uint bucket_max_num = 30;                           // The maximum depth of our routing table
+        uint bucket_max_num = 999;                          // The maximum depth of our routing table
         uint bucket_cache_size = 8;                         // Size of each bucket's cache
+	uint bucket_lock_good_id_nodes = 3;                 // The minimum number of good nodes with trusted ID to lock bucket
+	uint bucket_unlock_nodes = 2;                       // If a locked bucket falls to 2 nodes or below, unlock it
         uint junk_honeypot_bits = 31;                       // Number of common bits for detecting a "honeypot" peer
         uint junk_seen_addresses_max_age = 3600;            // Expire seen entries
         uint junk_blacklist_addresses_max_age = 3600;       // Expire blacklisted entries
@@ -87,6 +92,7 @@ class DHT {
         uint search_parallel_queries = 3;                   // Number of queries in parallel
         uint search_max_ping_time = 2;                      // Wait before next ping
         uint search_boot_bucket_min = 4;                    // Min fill of bucket in boot search
+        uint scheduler_check_bucket_lock = 60;              // Lockdown of buckets for good IDs
         uint scheduler_expire_buckets = 60;                 // Service job to expire bucket entries
         uint scheduler_expire_storage = 60;                 // Service job to expire storage
         uint scheduler_expire_searches = 60;                // Service job to expire searches
@@ -103,13 +109,12 @@ class DHT {
         uint throttling_max_bucket = 400;                   // Maximum threshold tokens
         uint throttling_per_sec = 100;                      // Throttling per second	
     };
-
+    
     private static DHT singleton = null;
     
     public static globals_t globals;
     public static time_t now_t; // updated regularly
     private static time_t starttime;
-    public static DHTId myid;
     alias DHTBucketList = DoubleList!DHTBucket;
     public static DHTProtocol want = DHTProtocol.nowant;
 
@@ -139,8 +144,33 @@ class DHT {
         DHTNode[DHTId] bucket_nodes;
         idStorage*[DHTId] storage;
         Search*[DHTtid] searches;
+	DHTId myid; // Due to security extensions IPv4 and IPv6 may have different IDs.
+	// IP and IP voting
+	ubyte[] own_ip = [127,0,0,1]; // Dummy default address
+	bool ip_voting=false;
+	const uint ip_voting_size = 8;
+	uint ip_voting_num=0;
+	ubyte[][ip_voting_size] own_ip_vote;
+	
         bool is_v6;
 	uint parsed_recv = 0;               // messages successfully parsed - also needed for num_nodes
+
+        void reset_buckets(){
+	    DHTBucket b;
+	    if(buckets.num == 0){
+	        b = new DHTBucket(DHTId.zero, &this);
+                buckets.addBack(b);
+	    } else {
+	        b = buckets.first;
+		b.next = null;
+		buckets.last = b;
+		buckets.num = 1;
+		b.nodes.reset();
+	    }
+	    bucket_nodes.clear;
+            my_bucket = b;
+	}    
+
         version (statistics) {
             ulong data_send_net = 0, // Raw data statistics; gross = w/ IP+UDP header  
             data_send_gross = 0, data_recv_net = 0,
@@ -161,6 +191,11 @@ class DHT {
             if (s is null)
                 return "";
             auto a = appender!string();
+	    a ~= "ID: ";
+	    a ~= myid.toString;
+	    a ~= ' ';
+	    a ~= to_address(own_ip).toAddrString();
+	    a ~= '\n';
             a ~= (is_v6 ? "IPv6" : "IPv4") ~ " Buckets:\n";
             for (auto b = buckets.first; b; b = b.next)
                 a ~= b.toString;
@@ -222,6 +257,7 @@ class DHT {
         ubyte[] values, values6;
         DHTProtocol want;
         ubyte[] ttid;
+	ubyte[] own_ip;
         string toString() {
             return "message: " ~ to!string(message) ~ 
                 "\ntid: " ~ (tid.length == 4 ? DHTtid(tid).toString : to!string(tid)) ~ 
@@ -318,7 +354,7 @@ class DHT {
         ubyte[] token;
         time_t age, last_pinged;
         Status status;
-
+        bool id_matches_ip;
 
         this(Search* s, DHTId nid, Address a) {
             id = nid;
@@ -328,6 +364,7 @@ class DHT {
             last_pinged = 0;
             s.snodes_seen[nid] = &this;
             status = Status.fresh;
+	    id_matches_ip = is_id_by_ip(id,to_blob(address));
         }
 
         @property string toString(Search* s) {
@@ -337,7 +374,7 @@ class DHT {
             version (disable_blacklisting)
                 version (statistics)
                     return to!string(sformat(buf,
-                        "%s %-47s age: %-6s lp: %-6s %3d bits (%s)%s", id,
+                        "%s %-47s age: %-6s lp: %-6s %3d bits (%s)%s", id.toString() ~ (id_matches_ip ? "T" : " "),
                         to!string(address), age.to_ascii(),
                         last_pinged.to_ascii(), id.common_bits(s.info_hash),
                         status,
@@ -346,7 +383,7 @@ class DHT {
                             " (in blacklist)" : ""));
 
             return to!string(sformat(buf,
-                "%s %-*s age: %-6s lp: %-6s %3d bits (%s)", id,
+                "%s %-*s age: %-6s lp: %-6s %3d bits (%s)", id.toString() ~ (id_matches_ip ? "T" : " "),
                 address.addressFamily == AddressFamily.INET ? 21 : 47,
                 to!string(address), age.to_ascii(), last_pinged.to_ascii(),
                 id.common_bits(s.info_hash), status));
@@ -372,6 +409,7 @@ class DHT {
         rehash,
 	random_search,
 	ping_walker,
+	check_bucket_lock,
     };
 
     /**********************************************************
@@ -386,23 +424,21 @@ class DHT {
      * See_Also: callback_t, DHTId
      */
 
-    this(DHTId myID, Socket sock4, Socket sock6, callback_t callBack) {
+    this(DHTId myID4, DHTId myID6,Socket sock4, Socket sock6, callback_t callBack) {
         assert(singleton is null);
 	
 	singleton = this;
 	
 	now_t = time(null);
         starttime = now;
-        myid = myID;
+        info.myid = myID4;
+        info6.myid = myID6;
         info.s = sock4;
         info6.s = sock6;
-        DHTBucket b = new DHTBucket(DHTId.zero, &info);
-        info.buckets.addBack(b);
-        info.my_bucket = b;
-        b = new DHTBucket(DHTId.zero, &info6);
-        info6.buckets.addBack(b);
-        info6.my_bucket = b;
+        info.reset_buckets();
+        info6.reset_buckets();
         info6.is_v6 = true;
+	info6.own_ip = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]; 
         if (sock4)
             want |= DHTProtocol.want4;
         if (sock6)
@@ -429,9 +465,11 @@ class DHT {
             globals.scheduler_push_searches, globals.scheduler_push_searches, now);
         scheduler.add(ScheduleType.rehash, () { rehash(); },
             globals.scheduler_rehash, globals.scheduler_rehash + 1, now);
+        scheduler.add(ScheduleType.check_bucket_lock, () { check_bucket_lock(); },
+            globals.scheduler_check_bucket_lock, globals.scheduler_check_bucket_lock, now);
 
     }
-    
+
     //
     // This returns the total number of good, dubious and cached nodes in your DHT.
     // For displaying DHT information in your client, or deciding if to start
@@ -478,13 +516,19 @@ class DHT {
     // get_nodes returns an array of the oldest good nodes, starting from the deepest bucket.
     // This method should be used to save your routing table.
     alias cond_t = bool function(DHTNode);
-    public NodeInfo[] get_nodes(uint maxnumnodes = 9999,uint per_bucket = globals.save_top_n, cond_t condition = null) {
+    public NodeInfo[] get_nodes(DHTProtocol protocol = DHTProtocol.want46, uint maxnumnodes = 9999,uint per_bucket = globals.save_top_n, cond_t condition = null) {
 	
-        if(want == DHTProtocol.want46)
-	    maxnumnodes /= 2; // per protocol
+        DHTInfo*[] pchoice;
+	if(protocol & DHTProtocol.want4)
+	    pchoice ~= &info;
+	if(protocol & DHTProtocol.want6)
+	    pchoice ~= &info6;
+	    
+	if(protocol == DHTProtocol.want46)
+	    maxnumnodes /= 2; // don't exceed limit
 	    
 	auto nodes = appender!(NodeInfo[])();
-	foreach(pinfo; [&info, &info6]){
+	foreach(pinfo; pchoice){
 	    uint numnodes = 0;
 	    auto walkleft = pinfo.my_bucket;
 	    auto walkright = pinfo.my_bucket.next;
@@ -533,28 +577,15 @@ class DHT {
 
 	// This is necessary, as some functions as getAddress() return
 	// the opaque Address subtype UnknownAddressReference
-        if(typeid(address) == typeid(InternetAddress))
-	    pinfo = &info;
-	else if(typeid(address) == typeid(Internet6Address))
-	    pinfo = &info6;
-	else if(typeid(address) == typeid(UnknownAddressReference)){
-	    if(address.addressFamily == AddressFamily.INET){
-	        address = new InternetAddress(*(cast(sockaddr_in*)address.name));
-		pinfo = &info;
-	    } else if(address.addressFamily == AddressFamily.INET6){
-	        address = new Internet6Address((cast(sockaddr_in6*)address.name).sin6_addr.s6_addr, 
-		    ntohs((cast(sockaddr_in6*)address.name).sin6_port));
-		pinfo = &info6;
-	    } else
-	        assert(0);
-	} else
-	    assert(0);
- 
-	    
+        address =  address.to_subtype();
+        pinfo = (address.addressFamily == AddressFamily.INET6 ? &info6 : &info);
+	
 	DHTBucket bucket = find_bucket(pinfo,id);
 	if(eager_split) // Special case - split faster, using save_top_n - This is for initial loading of buckets
 	    while(bucket.nodes.num >= globals.save_top_n){
-	        if(bucket is pinfo.my_bucket)
+	        if(pinfo.buckets.num >= globals.bucket_max_num) // No more buckets allowed
+		    break;
+		else if(bucket is pinfo.my_bucket)
 	            pinfo.my_bucket.split();
 	        else // other bucket is full - shouldn't happen
 	    	    break;
@@ -564,6 +595,8 @@ class DHT {
 	
 	
 	while(bucket.nodes.num >= globals.bucket_size){
+           if(pinfo.buckets.num >= globals.bucket_max_num) // No more buckets allowed
+   	        break;
 	    if(bucket is pinfo.my_bucket)
 	        pinfo.my_bucket.split();
 	    else // other bucket is full - shouldn't happen
@@ -581,8 +614,6 @@ class DHT {
     
     override public string toString() @property {
         auto a = appender!string();
-	a ~= "ID: ";
-	a ~= myid.toString;
 	a ~= '\n';
 	if(want & DHTProtocol.want4){
 	    a ~= "IPv4:\n";
@@ -708,7 +739,16 @@ class DHT {
             return;
         }
 
+	version(protocol_trace)
+	    if(wm.tid.length == 4)
+	        fLog.info("Message Type: ", wm.message, " TID=", DHTtid(wm.tid));
+            else		    
+	        fLog.info("Message Type: ", wm.message);
+	
+
+	
         switch (wm.message) {
+	
         case DHTMessageType.reply:
             DHTtid thistid;
             if (wm.tid.length == 4)
@@ -768,15 +808,18 @@ class DHT {
                 if (search_step1(pinfo, s, wm.id, wm.token, from))
                     search_step2(pinfo, s, is_v6 ? wm.nodes6 : wm.nodes,
                         is_v6 ? wm.values6 : wm.values);
-                if (want == DHTProtocol.want46) {
+		// Normal, non-boot searches are always done in both networks.
+		// If a multi-protocol client answers, the response can also contain 
+		// nodes for the other network.	A boot search is network-specific.
+                if (want == DHTProtocol.want46 && !s.is_boot_search) {
                     auto opinfo = other_pinfo(pinfo);
                     if (opinfo is null) {
-                        fLog.warning("Yikes!");
+                        fLog.warning("  No twin search in other network: ", wm.tid);
                         break;
                     }
                     auto os = find_search(opinfo, thistid);
                     if (os is null) {
-                        fLog.warning("Yikes!");
+			fLog.warning("");
                         break;
                     }
                     if (is_v6) {
@@ -838,7 +881,7 @@ class DHT {
                     false), " expected\n", wm.token, " received");
                 return;
             }
-            storage_store(pinfo, wm.info_hash, from, wm.port);
+            storage_store(pinfo, wm.info_hash, from, wm.port,wm.id);
             fLog.info("Sending peer announced");
             DHTNode.send_peer_announced(pinfo, from, wm.tid);
             break;
@@ -846,10 +889,204 @@ class DHT {
             new_node(pinfo, wm.id, from, DHTNode.Reliability.sent);
             fLog.trace("Non-implemented message type: ", wm.message);
         }
+	
+	// Perform check of our own IP
+	if(wm.own_ip.length > 0)
+	    ip_check(pinfo,wm.own_ip);
 
     }
 
     protected bool parse_message(ubyte[] buf) {
+	version(protocol_trace)
+	    try {
+	        fLog.info("Incoming:\n",to_ascii(buf,true));
+	        fLog.info(bencode2ascii(buf));
+            } catch (Exception e) 
+                fLog.warning("Parse exception caught: ", e);
+
+        // Prep	    
+        wm = MessageWM.init; // Reset WM
+        buf ~= 0; // ensure terminating \0
+        ubyte[][] all_values; // values and values 6
+        ubyte[][] all_want; // n4/n6 in want flags
+        ubyte[] id;
+        ubyte[] nodes, nodes6;
+	
+	const DHTMessageType[string] MTypeMap = [
+	    "ping"          : DHTMessageType.ping,
+	    "find_node"     : DHTMessageType.find_node,
+	    "get_peers"     : DHTMessageType.get_peers,
+	    "announce_peer" : DHTMessageType.announce_peer
+	];
+	
+        alias FieldMapCallback = void delegate(ubyte[],ubyte[][],int);
+        const FieldMapCallback[string] FieldMap = [
+	    "info_hash" : (s,sl,i){ if(s.length == 20) wm.info_hash = DHTId(s);},
+	    "port"      : (s,sl,i){ wm.port    = to!ushort(i);},
+	    "target"    : (s,sl,i){ if(s.length == 20) wm.target = DHTId(s);},
+	    "token"     : (s,sl,i){ wm.token   = s;},
+	    "nodes"     : (s,sl,i){ nodes      = s;},
+	    "nodes6"    : (s,sl,i){ nodes6     = s;},
+	    "values"    : (s,sl,i){ all_values = sl;},
+	    "want"      : (s,sl,i){ all_want   = sl;},
+	    "e"         : (s,sl,i){ wm.message = DHTMessageType.error;},
+	    "q"         : (s,sl,i){ if(cast(string) s in MTypeMap) 
+	                                wm.message = MTypeMap[cast(string) s];  
+				    else
+					throw new Exception("Unknown message type: " ~ cast(string) s);
+				  },
+	    "t"         : (s,sl,i){ wm.tid = s; },
+	    "y"         : (s,sl,i){ if(s=="r".representation) wm.message = DHTMessageType.reply ; },
+	    "id"        : (s,sl,i){ id = s; },
+	    "v"         : (s,sl,i){}, // ignore version
+	    "ip"        : (s,sl,i){ wm.own_ip = s; }, 
+	    "p"         : (s,sl,i){ }, // ignore p (port)
+	];
+	
+	uint cur = 0;
+
+	void parse_token(string id, ubyte[] s, ubyte[][] sl = null, int i = 0){
+	    if(id in FieldMap)
+	        FieldMap[id](s,sl,i);
+	    else
+	        fLog.trace("Ignoring unknown item \"" ~ id ~ "\"");
+	}
+
+        ubyte[] parse_bencode_string(){
+            if(!isDigit(to!char(buf[cur])))
+                throw new Exception("broken message - string expected, but got: " ~ to_ascii(buf[cur .. $],true));
+        
+            uint end=cur;
+            while(end < buf.length && isDigit(to!char(buf[end])))
+                end++;
+        
+            if(end >= buf.length || buf[end] != ':')
+                throw new Exception("broken message - string");
+        	
+            uint len = to!uint(cast(string) buf[cur .. end]);
+            
+            if(end + len > buf.length)
+                throw new Exception("broken message - EOM in string");
+        	
+            cur = end + len + 1;	
+        	
+            return buf[(end+1) .. cur];
+        }
+	
+	void parse_bencode(string key_path = ""){
+            switch(buf[cur]){
+        	case 'd': // Dictionary: string-value pairs
+        	    cur++;
+        	    while(cur < buf.length && buf[cur] != 'e'){
+        		string key = cast(string) parse_bencode_string();
+			if(key_path.length > 0)
+        		    parse_bencode(key);
+			else
+        		    parse_bencode(key);
+        	    }
+        	    cur++;
+        	    break;
+        	case 'l': // List - always assume it's a string list
+        	    cur++;
+        	    auto list = appender!(ubyte[][])();
+		    while(cur < buf.length && buf[cur] != 'e')
+        		list ~= parse_bencode_string();
+        	    cur++;
+		    parse_token(key_path,null,list.data);
+        	    break;
+        	case 'i': // Integer
+        	    cur++;
+                    uint end = cur;
+        	    if(end >= buf.length)
+        	        throw new Exception("broken message: unexpected end in integer field");
+		    else if(isDigit(buf[end]) || buf[end] == '-')
+        	        end++;
+        	    else 
+        	        throw new Exception("broken message: invalid character in integer field");
+        	    
+        	    while(end < buf.length && buf[end]!='e'){
+        	        if(isDigit(buf[end]))
+        	            end++;
+        	        else 
+        	            throw new Exception("broken message");
+        	    }
+		    if(end == buf.length)
+        	        throw new Exception("broken message: unexpected end in integer field");
+		    
+                    parse_token(key_path,null,null,to!int(cast(string) buf[cur .. end]));
+        	    cur = end + 1;
+        	    break;
+        	case '0': .. case '9': // String    
+                    parse_token(key_path,parse_bencode_string);
+        	    break;
+        	default: throw new Exception("broken message: \"" ~ to_ascii(buf[cur .. $]) ~ "\"");
+            }	    
+        }
+
+	
+
+        try{
+	    // Apparently sometimes a junk byte is added to the end of the buffer - 
+	    // silently ignore it.
+            while(cur < buf.length-2 && buf[cur] != '\0')
+                parse_bencode();
+
+            // Postprocess captured fields
+            if (id.length != 20) {
+                fLog.warning("broken message: ID missing or broken");
+                return false;
+            }
+            wm.id = DHTId(id);
+
+            foreach (v; all_values) {
+                if (v.length == 6 && !is_martian(v, false) && !is_blacklisted(v))
+                    wm.values ~= v;
+                else if (v.length == 18 && !is_martian(v, true) && !is_blacklisted(v))
+                    wm.values6 ~= v;
+            }
+            foreach (v; all_want) {
+                if (v == ['n', '4']) // "n4"
+                    wm.want |= DHTProtocol.want4;
+                else if (v == ['n', '6']) // "n6"
+                    wm.want |= DHTProtocol.want6;
+            }
+
+            // Make sure incoming node data is clean
+            if ((nodes.length % 26 != 0) || (nodes6.length % 38 != 0))
+                return false;
+
+            auto nblob = appender!(ubyte[])();
+            while (nodes.length > 0) {
+                if (!is_junk(&DHT.info, DHTId(nodes[0 .. 20]), nodes[20 .. 26], false, false, "in get_peers/find_node reply"))
+                    nblob ~= nodes[0 .. 26];
+                nodes = nodes[26 .. $];
+            }
+            wm.nodes = nblob.data.dup;
+
+            auto n6blob = appender!(ubyte[])();
+            while (nodes6.length > 0) {
+                if (!is_junk(&DHT.info6, DHTId(nodes6[0 .. 20]), nodes6[20 .. 38], true, false, "in get_peers/find_node reply"))
+                    n6blob ~= nodes6[0 .. 38];
+                nodes6 = nodes6[38 .. $];
+            }
+            wm.nodes6 = n6blob.data.dup;
+
+
+	    // Some boot servers 
+	    
+        }	    
+        // Something went wrong
+        catch (Exception e) {
+            fLog.warning("Exception caught: ", e);
+            return false;
+        }
+        return true;
+    }
+
+    protected bool parse_message_old(ubyte[] buf) {
+	    version(protocol_trace)
+			fLog.info("Incoming:\n",to_ascii(buf,true),"\n",bencode2ascii(buf));
+			
         bool find_static_length_field(in ubyte[] haystack, in ubyte[] needle,
             out ubyte[] whereto, in ushort len) {
             const(ubyte)[] found = find(haystack, needle);
@@ -1056,7 +1293,9 @@ class DHT {
         }
         return true;
     }
-
+    
+    
+    
     protected static DHTBucket find_bucket(DHTInfo* pinfo, DHTId id) {
         DHTBucket b = pinfo.buckets.first;
         while (1) {
@@ -1095,15 +1334,28 @@ class DHT {
 
         bucket = find_bucket(pinfo, id);
         bool mybucket = (bucket is pinfo.my_bucket);
-
+        bool id_matches_ip;
+	bool id_match_checked = false;
+	
+	// see if we may insert this node at all
+	if(bucket.locked_for_good_ids){
+	    id_matches_ip = is_id_by_ip(id,to_blob(from));
+	    if(!id_matches_ip){
+	        fLog.trace("Won't store bad node in locked bucket");
+		return;
+	    } 
+	    id_match_checked = true;
+	}
+	
         /* Try to replace a bad node, moving backwards. Oldest, most reliable nodes stay at head of list */
         auto n = bucket.nodes.last;
         while (n !is null) {
             if (n.ping_count >= globals.bucket_max_ping_count
                     && n.last_pinged < now - globals.bucket_max_ping_time) {
+                auto newn = new DHTNode(id, from, bucket,id_match_checked,id_matches_ip);
+
                 pinfo.bucket_nodes.remove(n.id);
                 bucket.nodes.remove(n);
-                auto newn = new DHTNode(id, from, bucket);
                 newn.last_seen = rel == DHTNode.Reliability.dubious ? 0 : now;
                 newn.last_replied = rel == DHTNode.Reliability.replied ? now : 0;
                 bucket.nodes.addBack(newn);
@@ -1141,6 +1393,32 @@ class DHT {
                 return;
             }
 
+	    /* If this bucket is not yet locked and this is a matching node,
+	       try pushing out non-matching nodes. Replace the youngest one. */
+	    
+	    if(!bucket.locked_for_good_ids && rel != DHTNode.Reliability.dubious){
+                if(!id_match_checked){
+		    id_matches_ip = is_id_by_ip(id,to_blob(from));
+	            id_match_checked = true;	        
+	        }
+		
+		if(id_matches_ip)
+		    for(n = bucket.nodes.last; n !is null; n = n.prev)
+		        if(!n.id_matches_ip){
+                            auto newn = new DHTNode(id, from, bucket,id_match_checked,id_matches_ip);
+                            
+                            pinfo.bucket_nodes.remove(n.id);
+                            bucket.nodes.remove(n);
+                            newn.last_seen = rel == DHTNode.Reliability.dubious ? 0 : now;
+                            newn.last_replied = rel == DHTNode.Reliability.replied ? now : 0;
+                            bucket.nodes.addBack(newn);
+                            pinfo.bucket_nodes[id] = newn;
+                            fLog.trace("replaced non-matching");
+                            return;
+		        }
+	    
+	    }
+	    
             /* No space - cache away */
             if (rel != DHTNode.Reliability.dubious) {
                 bucket.store_cache(from);
@@ -1151,7 +1429,7 @@ class DHT {
         }
 
         /* Create new node */
-        this_node = new DHTNode(id, from, bucket);
+        this_node = new DHTNode(id, from, bucket,id_match_checked,id_matches_ip);
         this_node.last_seen = rel == DHTNode.Reliability.dubious ? 0 : now;
         this_node.last_replied = rel == DHTNode.Reliability.replied ? now : 0;
         pinfo.bucket_nodes[id] = this_node;
@@ -1183,7 +1461,7 @@ class DHT {
     private void neighbourhood_maintenance(DHTInfo* pinfo) {
         DHTBucket mb = pinfo.my_bucket;
         DHTBucket wb = mb;
-        DHTId lookfor = DHT.myid;
+        DHTId lookfor = pinfo.myid;
         lookfor.id[19] ^= 0xff; // 152 bit match to own ID    
 
         if (wb.next && (wb.nodes.num == 0 || uniform(0, 8) == 0))
@@ -1268,14 +1546,17 @@ class DHT {
     // from the cache instead.
     protected void expire_buckets(DHTInfo* pinfo) {
         uint removed_nodes = 0;
+	DHTNode nextnode;
 	for (auto bucket = pinfo.buckets.first; bucket !is null; bucket = bucket.next)
-            for (auto node = bucket.nodes.first; node !is null; node = node.next)
+            for (auto node = bucket.nodes.first; node !is null; node = nextnode){
+	        nextnode = node.next;
                 if (node.ping_count > globals.bucket_max_ping_count) {
                     bucket.nodes.remove(node);
                     bucket.send_cached_ping();
                     pinfo.bucket_nodes.remove(node.id);
 		    ++removed_nodes;
                 }
+	    }
 
         if(removed_nodes > 0)	
 	    fLog.info("Expired ",removed_nodes," ",pinfo.is_v6 ? "IPv6" : "IPv4", " nodes");	
@@ -1301,19 +1582,82 @@ class DHT {
             pinfo.searches.remove(sk);
     }
 
+    // Check if lock bucket:  Multi-protocol entry point
+    private void check_bucket_lock() {
+        fLog.trace("Checking buckets for lockdown");
+        if (want & DHTProtocol.want4)
+            check_bucket_lock(&info);
+        if (want & DHTProtocol.want6)
+            check_bucket_lock(&info6);
+    }
+    // Check each bucket if it has enough nodes where ID matches IP;
+    // If so, lockdown the bucket
+    private void check_bucket_lock(DHTInfo* pinfo) {
+	for (auto bucket = pinfo.buckets.first; bucket !is null; bucket = bucket.next){
+	    // If bucket is deserted due to locking, unlock it.
+	    if(bucket.locked_for_good_ids){
+	        if(bucket.nodes.num <= globals.bucket_unlock_nodes){
+		    fLog.trace("Unlocking ",pinfo.is_v6 ? "IPv6" : "IPv4"," bucket ",bucket.lower.toString(false)," nodes=",bucket.nodes.num);
+		    bucket.locked_for_good_ids = false;
+                }		    
+	        continue;
+	    }
+
+            if(bucket is pinfo.my_bucket && globals.bucket_max_num>1) 
+	        continue; // never lock own bucket - splitting slows down or is prohibited
+		
+	    int num_good_id_nodes = 0;
+		
+            for (auto node = bucket.nodes.first; node !is null; node = node.next)
+	        if(node.id_matches_ip && node.is_good)
+		    num_good_id_nodes++;
+	
+            if(num_good_id_nodes < globals.bucket_lock_good_id_nodes)
+                continue; // not yet enough	    
+		
+	    // remove all nodes where ID does not match IP	
+	    fLog.trace("Locking down ",pinfo.is_v6 ? "IPv6" : "IPv4"," bucket ",bucket.lower.toString(false));
+	    DHTNode next_node;
+            for (auto node = bucket.nodes.first; node !is null; node = next_node){
+	        next_node = node.next;
+	    
+	        if(!node.id_matches_ip){
+		    bucket.nodes.remove(node);
+		    pinfo.bucket_nodes.remove(node.id);
+		}
+	    }
+	    // Empty the cache - there may be more good nodes.
+	    bucket.send_cached_ping(DHT.globals.bucket_cache_size); 
+	    
+	    bucket.locked_for_good_ids = true;
+        }
+    }
+
+
+    
+    
     // Store an announced address. Addresses with the youngest announce time are 
     // at the back of the storage (simplifies cleanup)
-    private void storage_store(DHTInfo* pinfo, DHTId info_hash, Address from, ushort port) {
-        AddressBlob blob = to_addressblob(from);
-
+    private void storage_store(DHTInfo* pinfo, DHTId info_hash, Address from, ushort port, DHTId sender_id) {
         if (port == 0)
             return; // silently ignore junk port
 
+        AddressBlob blob = to_addressblob(from);
+
+	
         if (pinfo.is_v6)
             blob.port6 = htons(port);
         else
             blob.port4 = htons(port);
 
+        if(!is_id_by_ip(sender_id, pinfo.is_v6 ? blob.ablob6 : blob.ablob4)){
+            fLog.trace("Announcing ID ", sender_id," does not match IP, silently ignoring.");
+	    return;
+	}
+	
+	    
+	    
+	    
         fLog.trace(from, " announces ", info_hash, " at port ", port);
 
         idStorage* ids;
@@ -1392,6 +1736,7 @@ class DHT {
                 if (idstore.walker is head)
                     idstore.walker = null;
                 idstore.addresses.remove(head);
+		idstore.addresshash.remove(head.address);
             }
 
             if (idstore.addresses.num == 0)
@@ -1573,7 +1918,7 @@ class DHT {
                 }
 
                 s.numnodes++;
-                if ((id != myid) && (id !in s.snodes_seen)) {
+                if ((id != pinfo.myid) && (id !in s.snodes_seen)) {
                     new_node(pinfo, id, a, DHTNode.Reliability.dubious);
                     SearchNode* snode = new SearchNode(s, id, a);
                     sa ~= snode;
@@ -1582,7 +1927,7 @@ class DHT {
                     // bucket contains own ID or is less than half full.
                     if (s.is_boot_search) {
                         DHTBucket b = find_bucket(pinfo, id);
-                        while (b is pinfo.my_bucket && b.nodes.num >= globals.bucket_size) {
+                        while (b is pinfo.my_bucket && b.nodes.num >= globals.bucket_size && pinfo.buckets.num < globals.bucket_max_num) {
                             b.split();
                             b = find_bucket(pinfo, id);
                         }
@@ -1622,11 +1967,18 @@ class DHT {
                     s.info_hash, ra.data);
 
             // restrict to TOP n
-            if (s.snodes.length > globals.search_bucket_size) {
-                s.snodes.topN!"a.distance < b.distance"(globals.search_bucket_size);
+	    //enum sort_criteria = "(a.id_matches_p && a.status == SearchNode.Status.fresh) > (b.id_matches_p && b.status == SearchNode.Status.fresh)  a.distance < b.distance";
+            alias sort_criteria =  (a,b){
+	        auto ac = (a.id_matches_ip && a.status == SearchNode.Status.fresh);
+	        auto bc = (b.id_matches_ip && b.status == SearchNode.Status.fresh);
+		return((ac > bc) || ((ac == bc) && a.distance < b.distance));
+	    };
+		
+	    if (s.snodes.length > globals.search_bucket_size) {
+                s.snodes.topN!sort_criteria(globals.search_bucket_size);
                 s.snodes = s.snodes[0 .. globals.search_bucket_size];
             }
-            sort!"a.distance < b.distance"(s.snodes);
+            sort!sort_criteria(s.snodes);
 
             // Start with fresh nodes first - the chances of a node to answer
             // sinks rapidly with the 1st missed answer
@@ -1715,15 +2067,20 @@ class DHT {
 
     // A boot search is a search for our own ID, targetted at 
     // filling buckets quickly.
-    public void boot_search() {
-        DHTId near_me = myid;
-        near_me.id[19] ^= 0xff; // 152 bits identical
+    public void boot_search(DHTProtocol whichnet = DHT.want) {
+        DHTId near_me;
         DHTtid tid = DHTtid("gp");
 
-        if (DHT.want & DHTProtocol.want4)
+        if (whichnet & DHTProtocol.want4){
+	    near_me = info.myid;
+            near_me.id[19] ^= 0xff; // 152 bits identical
             new_search(&info, near_me, tid, 0, true);
-        if (DHT.want & DHTProtocol.want6)
+	}
+        if (whichnet & DHTProtocol.want6) {
+	    near_me = info6.myid;
+            near_me.id[19] ^= 0xff; // 152 bits identical
             new_search(&info6, near_me, tid, 0, true);
+	}
     }
 
     // Move searches forward:  Multi-protocol entry point
@@ -1805,7 +2162,7 @@ class DHT {
 
         // Search results may return our own ID.
         // This is still a junk result, but must not lead to blacklisting.
-        if (id == myid) {
+        if (id == pinfo.myid) {
             if (blacklist_own_id) {
                 version (warnBlacklist)
                     fLog.warning("Own ID with address ",
@@ -1818,7 +2175,7 @@ class DHT {
         }
 
         // Honeypot check
-        auto cb = id.common_bits(myid);
+        auto cb = id.common_bits(pinfo.myid);
         if (cb >= globals.junk_honeypot_bits) {
             version (warnBlacklist)
                 fLog.warning("ID ", id, " address ", to_address(ablob),
@@ -2181,6 +2538,85 @@ class DHT {
     protected ubyte[] gather_closest_nodes_for_reply(DHT.DHTInfo* pinfo, DHTId target, uint howmany) {
         return gather_closest_nodes(pinfo,target,howmany);
     }
+    
+    // IP check:
+    // This uses a "voting" mechanism which stores the last n 
+    // IP responses by peers. The IP with the most votes wins.
+    protected void ip_check(DHTInfo* pinfo,ubyte[] apparent_ip){
+        // remove port part & check if valid
+	switch(apparent_ip.length){
+	    case 4, 16: 
+	        break;
+	    case 6: 
+	        apparent_ip = apparent_ip[0..4];
+		break;
+	    case 18: 
+	        apparent_ip = apparent_ip[0..16];
+		break;
+	    default:
+	        fLog.info("Peer provided bad IP address");
+		return;
+	    }
+
+        if(pinfo.ip_voting){ // an IP vote is ongoing
+	    pinfo.own_ip_vote[pinfo.ip_voting_num++] = apparent_ip.dup;
+	    
+	    if(pinfo.ip_voting_num == pinfo.ip_voting_size){ // vote finished
+	        evaluate_ip_votes(pinfo);
+		pinfo.ip_voting = false;
+	    }
+	} else if(apparent_ip != pinfo.own_ip){ // Start new vote
+	    fLog.trace("New " ~ (pinfo.is_v6 ? "IPv6" : "IPv4" ) ~ " vote started - someone thinks we're " ~ to_address(apparent_ip).toAddrString());
+	    pinfo.ip_voting_num = 1;
+            pinfo.ip_voting = true;
+            pinfo.own_ip_vote[0] = apparent_ip.dup;	    
+	}
+    }
+    protected void evaluate_ip_votes(DHTInfo* pinfo){
+        uint[ubyte[]] vote_map;
+	
+	foreach(vote; pinfo.own_ip_vote)
+            ++vote_map[vote.idup];
+	
+	ubyte[] top_vote;
+	uint top_count=0;
+	
+	foreach(choice; vote_map.byKeyValue())
+	    if(choice.value>top_count){
+	        top_count = choice.value;
+		top_vote = choice.key.dup;
+	    }
+	fLog.trace((pinfo.is_v6 ? "IPv6" : "IPv4" ) ~ " vote finished. The winner is: ",top_vote.to_address().toAddrString());
+	
+	if(top_vote != pinfo.own_ip){
+	    fLog.warning((pinfo.is_v6 ? "IPv6" : "IPv4" ) ~ " address change detected: from ",pinfo.own_ip.to_address().toAddrString()," to ",top_vote.to_address().toAddrString());
+	    pinfo.own_ip = top_vote.dup; 
+            id_check(pinfo); 
+        } else 
+	    fLog.trace("No " ~ (pinfo.is_v6 ? "IPv6" : "IPv4" ) ~ " address change.");
+    }
+    public void id_check(){
+        if(want & DHTProtocol.want4)
+	    id_check(&info);
+        if(want & DHTProtocol.want6)
+	    id_check(&info6);
+    }
+    protected void id_check(DHTInfo* pinfo){
+        if(is_id_by_ip(pinfo.myid,pinfo.own_ip)){
+	    fLog.trace("No ID change necessary for ",pinfo.is_v6 ? "IPv6" : "IPv4");
+	    return;
+	} else {
+	    // Preserve existing nodes
+	    NodeInfo[] preserved_nodes = DHT.get_nodes(pinfo.is_v6 ? DHTProtocol.want6 : DHTProtocol.want4, 9999, 9999);
+	    pinfo.reset_buckets();
+	    pinfo.myid = id_by_ip(pinfo.own_ip);
+	    fLog.info("ID change for ",pinfo.is_v6 ? "IPv6" : "IPv4", " to ", pinfo.myid);
+	    insert_node(preserved_nodes);
+	    // Final step: Boot search
+	    boot_search(pinfo.is_v6 ? DHTProtocol.want6 : DHTProtocol.want4);
+	}
+    }
+    
 };
 
 // A simple double-linked list
@@ -2195,6 +2631,16 @@ public struct DoubleList(T) {
     TP last;
     ushort num;
 
+    void reset(){
+        TP nexte;
+        for(auto e = first; e !is null; e = nexte){
+	    nexte = e.next;
+	    e.next = e.prev = null;
+	}
+        first = last = null;
+        num = 0;	
+    }
+    
     void addBack(TP t) {
         if (last !is null)
             last.next = t;
@@ -2229,6 +2675,7 @@ public struct DoubleList(T) {
             e.prev.next = e.next;
         else
             first = e.next;
+	e.next = e.prev = null;    
         num--;
     }
 }
@@ -2245,6 +2692,7 @@ public class DHTBucket {
     public DHTNodeList nodes;
     private DHT.DHTInfo* info;
     private DHTCache cache;
+    public bool locked_for_good_ids = false;
 
     private struct CacheEntry {
         CacheEntry* next, prev;
@@ -2293,7 +2741,7 @@ public class DHTBucket {
             n = nx;
         }
 
-        if (DHT.myid >= new_id)
+        if (info.myid >= new_id)
             info.my_bucket = newb;
 
         send_cached_ping(DHT.globals.bucket_cache_size); // empty the cache
@@ -2333,11 +2781,11 @@ public class DHTBucket {
 
     public @property override string toString() {
         auto a = appender!string();
-        a ~= lower.toString(false) ~ " (" ~ to!string(nodes.num) ~ "/" ~ to!string(DHT.globals.bucket_size)~")" ~
+        a ~= lower.toString(false) ~ (locked_for_good_ids ? "T" : "" ) ~  " (" ~ to!string(nodes.num) ~ "/" ~ to!string(DHT.globals.bucket_size)~")" ~
 	" age: " ~ age.to_ascii() ~ (
             this == info.my_bucket ? " (mine)" : "") ~ (
             cache.num ? (" (cached " ~ to!string(cache.num) ~ ")") : "") ~ " " ~ to!string(
-            lower.common_bits(DHT.myid)) ~ " bits\n";
+            lower.common_bits(info.myid)) ~ " bits\n";
         for (auto n = nodes.first; n; n = n.next)
             a ~= "  " ~ n.toString() ~ "\n";
 
@@ -2394,14 +2842,19 @@ class DHTNode {
     public time_t first_seen, last_seen, last_replied, last_pinged;
     public ushort ping_count;
     public DHTBucket bucket;
-
-    public this(DHTId i, Address a, DHTBucket b) {
+    bool   id_matches_ip;
+    
+    public this(DHTId i, Address a, DHTBucket b,bool know_id_status=false,bool id_status = false) {
         id = i;
         address = a;
         first_seen = DHT.now;
         last_seen = last_replied = last_pinged = 0;
         ping_count = 0;
         bucket = b;
+	if(know_id_status)
+	    id_matches_ip = id_status;
+	else
+	    id_matches_ip = is_id_by_ip(id,to_blob(a));
     }
 
     public @property bool is_good() {
@@ -2423,26 +2876,44 @@ class DHTNode {
 
     public static void send_ping(Socket s, Address a) {
         static const ubyte[] head = "d1:ad2:id20:".representation;
-        static const ubyte[] tail = "e1:q4:ping1:t4:pn\x00\x001:y1:qe".representation;
-        ubyte[] msg = head ~ DHT.myid.id ~ tail;
-        s.sendTo(msg, cast(SocketFlags) 0, a);
+        static const ubyte[] tail = "1:q4:ping1:t4:pn\x00\x001:y1:qe".representation;
+	DHT.DHTInfo* pinfo = a.addressFamily == AddressFamily.INET ? &DHT.info : &DHT.info6; 
+
+	ubyte[] blob = a.to_blob();
+	
+        auto msg = appender!(ubyte[])();
+        msg ~= head ;
+	msg ~= pinfo.myid.id[];
+	msg ~= (blob.length == 6 ? "e2:ip6:".representation : "e2:ip18:".representation);
+        msg ~= blob;
+	msg ~= tail;
+	
+        s.sendTo(msg.data, cast(SocketFlags) 0, a);
         version (statistics)
-            update_statistics(s, msg.length);
+            update_statistics(s, msg.data.length);
+	version(protocol_trace){
+	    fLog.info("Outgoing:\n",to_ascii(msg.data,true));
+	    fLog.info("Outgoing:\n",bencode2ascii(msg.data));
+	}
     }
 
     public static void send_find_node(DHT.DHTInfo* pinfo, DHTtid tid, DHTId target,
         Address address, DHTProtocol want) {
         static const ubyte[] part1 = "d1:ad2:id20:".representation;
         static const ubyte[] part2 = "6:target20:".representation;
-        static const ubyte[] part3 = "e1:q9:find_node1:t4:".representation;
+        static const ubyte[] part3 = "1:q9:find_node1:t4:".representation;
         static const ubyte[] part4 = "1:y1:qe".representation;
 
+	ubyte[] blob = address.to_blob();
+	
         auto msg = appender!(ubyte[])();
         msg ~= part1;
-        msg ~= DHT.myid.id[];
+        msg ~= pinfo.myid.id[];
         msg ~= part2;
         msg ~= target.id[];
         msg ~= wantchoice[want];
+	msg ~= (blob.length == 6 ? "e2:ip6:".representation : "e2:ip18:".representation);
+        msg ~= blob;
         msg ~= part3;
         msg ~= tid.tid[];
         msg ~= part4;
@@ -2450,6 +2921,8 @@ class DHTNode {
         pinfo.s.sendTo(msg.data, cast(SocketFlags) 0, address);
         version (statistics)
             update_statistics(pinfo, msg.data.length);
+	version(protocol_trace)
+	    fLog.info("Outgoing:\n",bencode2ascii(msg.data));
     }
 
     public static void send_announce_peer(DHT.DHTInfo* pinfo, Address address,
@@ -2458,12 +2931,14 @@ class DHTNode {
         static const ubyte[] part2 = "9:info_hash20:".representation;
         static const ubyte[] part3 = "4:porti".representation;
         static const ubyte[] part4 = "e5:token".representation;
-        static const ubyte[] part5 = "e1:q13:announce_peer1:t4:".representation;
+        static const ubyte[] part5 = "1:q13:announce_peer1:t4:".representation;
         static const ubyte[] part6 = "1:y1:qe".representation;
 
+	ubyte[] blob = address.to_blob();
+	
         auto msg = appender!(ubyte[])();
         msg ~= part1;
-        msg ~= DHT.myid.id[];
+        msg ~= pinfo.myid.id[];
         msg ~= part2;
         msg ~= info_hash.id[];
         msg ~= part3;
@@ -2472,6 +2947,8 @@ class DHTNode {
         msg ~= cast(ubyte[]) to!string(token.length);
         msg ~= ':';
         msg ~= token;
+	msg ~= (blob.length == 6 ? "e2:ip6:".representation : "e2:ip18:".representation);
+        msg ~= blob;
         msg ~= part5;
         msg ~= tid.tid[];
         msg ~= part6;
@@ -2479,6 +2956,8 @@ class DHTNode {
         pinfo.s.sendTo(msg.data, cast(SocketFlags) 0, address);
         version (statistics)
             update_statistics(pinfo, msg.data.length);
+	version(protocol_trace)
+	    fLog.info("Outgoing:\n",bencode2ascii(msg.data));
     }
 
     public void send_find_node(DHTtid tid, DHTId target, DHTProtocol want) {
@@ -2489,15 +2968,19 @@ class DHTNode {
         DHTId info_hash, DHTProtocol want) {
         static const ubyte[] part1 = "d1:ad2:id20:".representation;
         static const ubyte[] part2 = "9:info_hash20:".representation;
-        static const ubyte[] part3 = "e1:q9:get_peers1:t4:".representation;
+        static const ubyte[] part3 = "1:q9:get_peers1:t4:".representation;
         static const ubyte[] part4 = "1:y1:qe".representation;
 
+	ubyte[] blob = address.to_blob();
+	
         auto msg = appender!(ubyte[])();
         msg ~= part1;
-        msg ~= DHT.myid.id[];
+        msg ~= pinfo.myid.id[];
         msg ~= part2;
         msg ~= info_hash.id[];
         msg ~= wantchoice[want];
+	msg ~= (blob.length == 6 ? "e2:ip6:".representation : "e2:ip18:".representation);
+        msg ~= blob;
         msg ~= part3;
         msg ~= tid.tid[];
         msg ~= part4;
@@ -2505,6 +2988,8 @@ class DHTNode {
         pinfo.s.sendTo(msg.data, cast(SocketFlags) 0, address);
         version (statistics)
             update_statistics(pinfo, msg.data.length);
+	version(protocol_trace)
+	    fLog.info("Outgoing:\n",bencode2ascii(msg.data));
     }
 
     public alias send_closest_nodes = send_nodes_peers; // identical
@@ -2513,6 +2998,8 @@ class DHTNode {
         ubyte[] tid, DHTId target, DHTProtocol want, ubyte[] token = [], ubyte[] peers = []) {
         ubyte[] nodes, nodes6;
 
+	ubyte[] blob = address.to_blob();
+	
         if (want == DHTProtocol.nowant) { // no preference, use native
             if (pinfo.is_v6)
                 want = DHTProtocol.want6;
@@ -2526,15 +3013,21 @@ class DHTNode {
         if (want & DHTProtocol.want6)
             nodes6 = DHT.get_instance.gather_closest_nodes_for_reply(&DHT.info6, target, 8);
 
-        static const ubyte[] part1 = "d1:rd2:id20:".representation;
+        static const ubyte[] part0 = "d2:ip".representation;
+        static const ubyte[] part1 = "1:rd2:id20:".representation;
         static const ubyte[] part2 = "6:valuesl".representation;
         static const ubyte[] part3 = "e".representation;
         static const ubyte[] part4 = "1:y1:re".representation;
 
         auto msg = appender!(ubyte[])();
 
+        msg ~= part0;
+	msg ~= (blob.length == 6 ? "6:".representation : "18:".representation);
+        msg ~= blob;
+	
+	
         msg ~= part1;
-        msg ~= DHT.myid.id[];
+        msg ~= pinfo.myid.id[];
         if (nodes.length > 0) {
             msg ~= cast(ubyte[])("5:nodes" ~ to!string(nodes.length) ~ ":");
             msg ~= nodes;
@@ -2576,6 +3069,8 @@ class DHTNode {
         pinfo.s.sendTo(msg.data, cast(SocketFlags) 0, address);
         version (statistics)
             update_statistics(pinfo, msg.data.length);
+	version(protocol_trace)
+	    fLog.info("Outgoing:\n",bencode2ascii(msg.data));
     }
 
     version (statistics) {
@@ -2610,12 +3105,21 @@ class DHTNode {
     public alias send_pong = send_peer_announced;
 
     public static void send_peer_announced(DHT.DHTInfo* pinfo, Address address, ubyte[] tid) {
-        static const ubyte[] part1 = "d1:rd2:id20:".representation;
+        static const ubyte[] part0 = "d2:ip".representation;
+        static const ubyte[] part1 = "1:rd2:id20:".representation;
         static const ubyte[] part2 = "1:y1:re".representation;
         auto msg = appender!(ubyte[])();
 
+	ubyte[] blob = address.to_blob();
+
+        msg ~= part0;
+	msg ~= cast(ubyte[]) to!string(blob.length);
+	msg ~= ':';
+        msg ~= blob;
+	
         msg ~= part1;
-        msg ~= DHT.myid.id[];
+        msg ~= pinfo.myid.id[];
+
         msg ~= cast(ubyte[])("e1:t" ~ to!string(tid.length) ~ ":");
         msg ~= tid;
         msg ~= part2;
@@ -2623,6 +3127,8 @@ class DHTNode {
         pinfo.s.sendTo(msg.data, cast(SocketFlags) 0, address);
         version (statistics)
             update_statistics(pinfo, msg.data.length);
+	version(protocol_trace)
+	    fLog.info("Outgoing:\n",bencode2ascii(msg.data));
     }
 
     public void pinged() {
@@ -2641,25 +3147,27 @@ class DHTNode {
             version (statistics)
                 return to!string(sformat(buf,
                     "%s %-*s age: %-6s ls: %-6s lr: %-6s lp: %-6s pc: %d%s%s%s",
-                    id, bucket.info.is_v6 ? 47 : 21,
+                    id.toString() ~ (id_matches_ip ? "T" : " "), bucket.info.is_v6 ? 47 : 21,
                     to!string(address), first_seen.to_ascii(),
                     last_seen.to_ascii(), last_replied.to_ascii(),
                     last_pinged.to_ascii(), ping_count,
                     (is_good ? " (good)" : ""),
                     (
                     bucket.info.my_bucket == bucket ? " (" ~ to!string(
-                    id.common_bits(DHT.myid)) ~ " bits)" : ""),
+                    id.common_bits(pinfo.myid)) ~ " bits)" : ""),
                     DHT.is_really_blacklisted(bucket.info, address) ? " (blacklisted)" : ""));
 
+	DHTId* myid = address.addressFamily == AddressFamily.INET6 ? &DHT.info6.myid : &DHT.info.myid;
+		    
         return to!string(sformat(buf,
-            "%s %-*s age: %-6s ls: %-6s lr: %-6s lp: %-6s pc: %d%s%s", id,
+            "%s %-*s age: %-6s ls: %-6s lr: %-6s lp: %-6s pc: %d%s%s", id.toString() ~ (id_matches_ip ? "T" : " "),
             bucket.info.is_v6 ? 47 : 21,
             to!string(address), first_seen.to_ascii(), last_seen.to_ascii(),
             last_replied.to_ascii(), last_pinged.to_ascii(), ping_count,
             (is_good ? " (good)" : ""),
             (
             bucket.info.my_bucket == bucket ? " (" ~ to!string(
-            id.common_bits(DHT.myid)) ~ " bits)" : "")));
+            id.common_bits(*myid)) ~ " bits)" : "")));
     }
 };
 
@@ -2862,16 +3370,26 @@ public struct DHTtid {
     }
 };
 
-static string to_ascii(in ubyte[] ub) {
+static string to_ascii(in ubyte[] ub, bool dots = false) {
     auto a = appender!string();
-    foreach (c; ub) {
-        if (c == 0)
-            a ~= "\\0";
-        else if (isPrintable(to!char(c)))
-            a ~= to!char(c);
-        else
-            formattedWrite(a, "\\x%02x", c);
-    }
+    if(dots)
+		foreach (c; ub) {
+			if (c == 0)
+				a ~= ".";
+			else if (isPrintable(to!char(c)))
+				a ~= to!char(c);
+			else
+				a ~= ".";
+		}
+	else
+		foreach (c; ub) {
+			if (c == 0)
+				a ~= "\\0";
+			else if (isPrintable(to!char(c)))
+				a ~= to!char(c);
+			else
+				formattedWrite(a, "\\x%02x", c);
+		}
     return a.data;
 }
 
@@ -2930,7 +3448,7 @@ private struct AddressBlob {
 }
 
 // Convert AddressBlob to Address instance	
-static Address to_address(const ubyte[] buf) {
+public Address to_address(const ubyte[] buf) {
     AddressBlob blob;
 
     switch(buf.length){
@@ -2995,7 +3513,7 @@ static ubyte[] to_blacklistblob(ubyte[] ablob) {
     }
 }
 
-static ubyte[] to_blob(Address a) {
+public ubyte[] to_blob(Address a) {
     AddressBlob* blob = new AddressBlob;
 
     switch(a.addressFamily){
@@ -3060,3 +3578,242 @@ static Address to_v4(ubyte[] blob){
 
     return new InternetAddress(ntohl(v4.addr4),ntohs(a.port6));
 }
+
+// Convert UnknownAddressReference
+public Address to_subtype(Address a){
+    if (typeid(a) == typeid(InternetAddress)) {}
+    else if(typeid(a) == typeid(Internet6Address)) {}
+    else if(typeid(a) == typeid(UnknownAddressReference)) {
+	if(a.addressFamily == AddressFamily.INET){
+	    a = new InternetAddress(*(cast(sockaddr_in*)a.name));
+	} else if(a.addressFamily == AddressFamily.INET6){
+	    a = new Internet6Address((cast(sockaddr_in6*)a.name).sin6_addr.s6_addr, 
+	    ntohs((cast(sockaddr_in6*)a.name).sin6_port));
+	} else
+	    assert(0);
+	
+    } else assert(0);
+    return a;
+}
+
+
+// Message debugging
+//
+//
+
+alias StringAppender = typeof(appender!string());
+
+static string bencode2ascii(ubyte[] buf){
+    StringAppender output = appender!string();
+    output ~= to_ascii(buf,true) ~ "\n";
+    uint cur = 0; 
+    // ignore trailing junk byte
+    while(cur < buf.length - 1 && buf[cur] != '\0')
+        bencode2ascii_step(buf,cur,output);
+    return output.data.dup;
+}
+
+static void bencode2ascii_step(ubyte[] buf, ref uint cur, ref StringAppender output, uint ind=0){
+    switch(buf[cur]){
+	case 'd': // Dictionary: string-value pairs
+	    output ~= "{\n";
+	    cur++;
+	    while(buf[cur]!='e'){
+	        output.indent(ind+2);
+		output ~= bencode2ascii_string(buf,cur);
+		output ~= "=";
+		bencode2ascii_step(buf,cur,output,ind+2);
+	    }
+	    output.indent(ind);
+	    output ~= "}\n";
+	    cur++;
+	    break;
+	case 'l': // List
+	    output ~= "[\n";
+	    cur++;
+	    while(buf[cur]!='e'){
+	        output.indent(ind+2);
+		bencode2ascii_step(buf,cur,output,ind+2);
+	    }
+	    output.indent(ind);
+	    output ~= "]\n";
+	    cur++;
+	    break;
+	case 'i': // Integer
+	    cur++;
+            uint end = cur;
+	    if(isDigit(buf[end]) || buf[end] == '-')
+	        end++;
+	    else 
+	        throw new Exception("broken message");
+	    
+	    while(buf[end]!='e'){
+	        if(isDigit(buf[end]))
+	            end++;
+	        else 
+	            throw new Exception("broken message");
+	    }
+            output ~= cast(string) buf[cur .. end];
+	    output ~= "\n";
+	    cur = end + 1;
+	    break;
+	case '0': .. case '9': // String    
+	    ubyte[] block = bencode2ascii_string(buf,cur);
+	    output ~= '"';
+	    output ~= to_ascii(block,true);
+	    output ~= "\" ";
+	    foreach(c; block)
+	        output.formattedWrite("%02x",c);
+		
+	    switch(block.length){
+	        case 4,6,16,18: 
+		    output ~= ' ';     
+		    output ~= to_address(block).toString();
+		    break;
+		default:
+            }	    
+		
+	    output ~= "\n";
+	    break;
+	default: throw new Exception("broken message@" ~ to!string(cur) ~ ": \"" ~ to_ascii(buf[cur .. $]) ~ "\"");
+    }	    
+}
+
+void indent(ref StringAppender output, uint spaces){
+    while(spaces--)
+        output ~= " ";
+}
+
+// Move cur and return string. 
+static ubyte[] bencode2ascii_string(ubyte[] buf, ref uint cur){
+    if(!isDigit(to!char(buf[cur])))
+        throw new Exception("broken message");
+
+    uint end=cur;
+    while(end < buf.length && isDigit(to!char(buf[end])))
+        end++;
+
+    if(end >= buf.length || buf[end] != ':')
+        throw new Exception("broken message");
+	
+    uint len = to!uint(cast(string) buf[cur .. end]);
+    
+    if(end + len > buf.length - 2)
+        throw new Exception("broken message");
+	
+    cur = end + len + 1;	
+	
+    return buf[(end+1) .. cur];
+}
+	
+// Security extensions against sybils - see https://libtorrent.org/dht_sec.html
+//
+//
+	
+alias CRC32C = CRC!(32u, 0x82F63B78);
+
+    // Endianess is an issue, so we use uint
+union IntBlob{
+    ubyte[4] ub;
+    uint     ui;
+}
+
+// Create a valid own ID by given IP
+static DHTId id_by_ip(ubyte[] ip){
+    ip = ip.dup;
+
+    int num_octets;
+    DHTId id;
+    
+    
+    switch(ip.length){
+        case 16, 18:
+	    num_octets = 8; break;
+        case 4, 6:
+	    num_octets = 4; break;
+	default:
+	    assert(0);
+    }
+    
+    static const ubyte[] v4_mask = [ 0x03, 0x0f, 0x3f, 0xff ];
+    static const ubyte[] v6_mask = [ 0x01, 0x03, 0x07, 0x0f, 0x1f, 0x3f, 0x7f, 0xff ];
+    const ubyte[] mask = num_octets == 4 ? v4_mask : v6_mask;
+    
+    for (int i = 0; i < num_octets; ++i)
+        ip[i] &= mask[i];
+
+    ubyte rand = cast(ubyte) uniform(0,256);
+    version (limit_random_id)
+        rand = 0x42;
+    
+    ubyte r = rand & 0x7;
+    ip[0] |= r << 5;
+    
+    CRC32C crc32c;
+    crc32c.put(ip[0..num_octets]);
+    IntBlob crc;
+    crc.ub = crc32c.finish;    
+    // only take the top 21 bits from crc
+    id.id[0] = (crc.ui >> 24) & 0xff;
+    id.id[1] = (crc.ui >> 16) & 0xff;
+    id.id[2] = ((crc.ui >> 8) & 0xf8) | (cast(ubyte)uniform(0,8));
+    for (int i = 3; i < 19; ++i) 
+        id.id[i] = cast(ubyte) uniform(0,256);
+    id.id[19] = rand;
+    
+    return id;
+}
+
+// Check if a given ID is valid by IP	
+// This checks the first 21 bits only, the rest is random.
+static bool is_id_by_ip(DHTId id, ubyte[] ip){
+    ip = ip.dup;
+
+    int num_octets;
+
+    ubyte[3] is_id = id.id[0..3];
+    ubyte[3] should_id;
+
+    switch(ip.length){
+        case 16, 18:
+	    num_octets = 8; break;
+        case 4, 6:
+	    num_octets = 4; break;
+	default:
+	    assert(0);
+    }
+    
+    static const ubyte[] v4_mask = [ 0x03, 0x0f, 0x3f, 0xff ];
+    static const ubyte[] v6_mask = [ 0x01, 0x03, 0x07, 0x0f, 0x1f, 0x3f, 0x7f, 0xff ];
+    const ubyte[] mask = num_octets == 4 ? v4_mask : v6_mask;
+
+    for (int i = 0; i < num_octets; ++i)
+        ip[i] &= mask[i];
+
+    ubyte rand = id.id[19];
+    ubyte r = rand & 0x7;
+    ip[0] |= r << 5;
+    
+    CRC32C crc32c;
+    crc32c.put(ip[0..num_octets]);
+    IntBlob crc;
+    crc.ub = crc32c.finish;    
+
+    // Create the "should" ID - first 21 bits only
+    should_id[0] = (crc.ui >> 24) & 0xff;
+    should_id[1] = (crc.ui >> 16) & 0xff;
+    should_id[2] = ((crc.ui >> 8) & 0xf8); // no additional random bytes here
+
+    // zero last 3 bits of "is" ID
+    is_id[2] &= 0xf8;
+    
+    return is_id == should_id;
+}
+    
+
+
+	
+	
+	
+	
+	
