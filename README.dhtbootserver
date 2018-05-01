@@ -5,6 +5,7 @@ core behaviour to:
  - one huge bucket per protocol to store mature nodes with any ID
  - A node is considered "mature" above a certain age (this should be at least 15
    minutes to allow newly booted nodes to accumulate a proper routing table)
+   (preset to 30 minutes)
  - The boot server will not react to message traffic initiated by mature nodes;
    ideally, this results in mature nodes removing the boot server from their
    routing tables, thus reducing traffic.
@@ -12,16 +13,37 @@ core behaviour to:
    8 mature nodes without considering proximity to the queried info_hash or ID. 
    This is done by sequentially traversing through the set of mature nodes.
    Non-mature nodes are not returned, unless there is no mature node in 
-   the entire bucket. Nodes which are not good are never returned.
+   the entire bucket. Nodes which are not good (having reacted to ping or
+   find_nodes in the last 15 minutes) are never returned.
  - The boot server ignores announce peer messages; it will never store 
    peer information. 
  - The routing tables are kept updated by traversing and pinging nodes;
    if the routing tables filled below a configurable threshold (default: 90%),
-   a find_node query with a random ID is used instead to fill the bucket.
+   a find_node query with a random ID is used instead of ping to fill the bucket.
  - Stale, "bad" nodes are only removed by the expire_buckets recurring job;
    the ping count threshold above by which a node is considered stale 
    depends on the age of the node, ranging from 2 pings from very young nodes,
    upto 7 pings for nodes older than one day.
- - Every 10 minutes, the boot server launches a search for a random infohash
+ - Every 10 minutes the boot server launches a search for a random infohash
    to fill its buckets beyond 90%
  - All Sybil attack protection mechanisms of dht-d are active.
+ 
+ ID restrictions
+---------------
+As per security enhancement described in https://libtorrent.org/dht_sec.html, 
+client IDs can no longer be freely chosen, but need to be tied to the client's
+public email address. The aim of this restriction is to avoid Sybil attacks.
+Client functionality includes:
+
+* Extensions to protocol ("ip" field in control protocol):
+The "ip" field reflects the public IP address at which other nodes can see your
+client. If your IP address changes, or isn't known at first client start, the 
+client will initiate a "voting" mechanism; the most common IP address from 
+8 protocol messages containing the client's public IP address is chosen. An 
+IP address change will lead to an ID change; as a side effect, the client 
+may no longer use the same ID in IPv4 and IPv6 networks.
+
+* Lockdown of bucket:
+If the single boot server bucket contains 50 or more peers which adhere to the ID schema, the 
+bucket is locked - non-adhering peers are removed, and only adhering peers 
+are allowed to be added. 

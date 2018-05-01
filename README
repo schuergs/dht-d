@@ -106,12 +106,39 @@ the result array can be limited.
 * DHT.toString
 
 Debugging aid to display the DHT buckets, ongoing searches, blacklists, etc. You
-also may want to modify the log level by disabling or enabling the lower log levels during compilation 
-(e.g., version=StdLoggerDisableTrace). Alternatively, you can also set the log
-level via globalLogLevel. Compiling the client with version=statistics gives you
-additional insights, such as the number messages and bytes sent and received,
-as well as a deeper peek at the blacklists.
+also may want to modify the log level by disabling or enabling the lower log 
+levels during compilation (e.g., version=StdLoggerDisableTrace). Alternatively,
+you can also set the log level via globalLogLevel. Compiling the client with
+version=statistics gives you additional insights, such as the number messages
+and bytes sent and received, as well as a deeper peek at the blacklists.
 
+
+
+ID restrictions
+---------------
+As per security enhancement described in https://libtorrent.org/dht_sec.html, 
+client IDs can no longer be freely chosen, but need to be tied to the client's
+public email address. The aim of this restriction is to avoid Sybil attacks.
+Client functionality includes:
+
+* Extensions to protocol ("ip" field in control protocol):
+The "ip" field reflects the public IP address at which other nodes can see your
+client. If your IP address changes, or isn't known at first client start, the 
+client will initiate a "voting" mechanism; the most common IP address from 
+8 protocol messages containing the client's public IP address is chosen. An 
+IP address change will lead to an ID change; as a side effect, the client 
+may no longer use the same ID in IPv4 and IPv6 networks.
+
+* Restrictions on announce_peer:
+Only peers which use an ID which adhers to their IP address may announce
+content. The announce command from other peers is ignored (still answering with
+"peer announced", but not storing).
+
+* Lockdown of buckets:
+If a bucket contains three or more peers which adhere to the ID schema, the 
+bucket is locked - non-adhering peers are removed, and only adhering peers 
+are allowed to be added. The bucket which contains the client's ID is never 
+locked, as this may impact bucket splitting.
 
 Additional protection against Sybil attacks
 -------------------------------------------
@@ -164,16 +191,17 @@ combination due to NATing. The Sybil watchlist will tolerate different IDs for
 the same address up to a configurable threshold (default: 3). Only if the
 threshold is exceeded, the address is blacklisted. 
 
+
 Final remarks
 -------------
 
 The code is still very "C-ish" and monolithic due to performance reasons. 
+The methods for sending messages are still quite cryptic and should be 
+rewritten. Another point to look at is network code performance; Phobos
+high-level objects (InternetAddress) and low-level binary IP addresses
+don't go well together.
+The main client code (dht.d) should be split into several files.
 
-Although the code has been tested in several multi-day test runs with random
-searches performed at five-sencond intervals, it has not been stress tested
-with a non-consumer, high-bandwidth internet connection. If you have such
-a conenction available, it would be great if you could perform a stress test
-and give me result feedback.
 
            Stefan Schuerger
 	   stefan (at) schuerger.com

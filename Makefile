@@ -2,7 +2,7 @@
 # Makefile to create dht_example and dhtbootserver_example 
 #
 #
-# Copyright (c) 2016 Stefan Schuerger
+# Copyright (c) 2016-2018 Stefan Schuerger
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -24,13 +24,17 @@
 #
 #
 
-CFLAGS=-g -version=statistics -version=StdLoggerDisableTrace
+CFLAGS=-g -O -version=statistics   -O
 LN=dmd
 CC=dmd
 # For ldc2, use:
-#DFLAGS=-g -O -d-version=StdLoggerDisableTrace -d-version=statistics 
+#CFLAGS=-g -O -d-version=StdLoggerDisableTrace -d-version=statistics 
 #LN=ldc2
 #CC=ldc2
+# For GDC, use:
+#CFLAGS=-g -O3 -fversion=statistics
+#LN=gdc
+#CC=gdc
 
 all: dht_example dhtbootserver_example
 
