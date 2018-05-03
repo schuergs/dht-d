@@ -813,13 +813,10 @@ class DHT {
 		// nodes for the other network.	A boot search is network-specific.
                 if (want == DHTProtocol.want46 && !s.is_boot_search) {
                     auto opinfo = other_pinfo(pinfo);
-                    if (opinfo is null) {
-                        fLog.warning("  No twin search in other network: ", wm.tid);
-                        break;
-                    }
+                    assert(opinfo !is null);
                     auto os = find_search(opinfo, thistid);
                     if (os is null) {
-			fLog.warning("");
+                        fLog.warning("  No twin search in other network: ", wm.tid);
                         break;
                     }
                     if (is_v6) {

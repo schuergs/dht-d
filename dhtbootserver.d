@@ -49,30 +49,34 @@ class DHTBootserver : DHT {
         uint scheduler_expire_buckets = 60;                 // Service job to expire bucket entries
         uint scheduler_ping_walker = 5;                     // Walk forward and ping
         uint scheduler_random_search = 600;                 // Start a random search to gather nodes
+        uint walker_steps = 64;                             // Number of nodes to ping for the walker
 	uint well_filled_percentage = 95;                   // well-filled watermark
+	uint bucket_lock_good_id_nodes = 50;                // The minimum number of good nodes with trusted ID to lock bucket
     };
 
     public static immutable globals_bs_t globals_bs;
     NodeCollector collector4, collector6;
-    PingWalker4 ping_walker4;
-    PingWalker6 ping_walker6;
+    PingWalker ping_walker4;
+    PingWalker ping_walker6;
     public static bool well_filled4 = false;
     public static bool well_filled6 = false;
     
-    alias PingWalker4 = Walker!(DHTNode,
-        (a){if(DHTBootserver.well_filled4) a.send_ping(); else  { a.send_find_node(DHTtid("fn", 0), DHTId.random, DHT.want); a.pinged();}}, // action
-	"!a.is_good && a.last_pinged <= DHT.now - DHTBootserver.globals_bs.bucket_max_ping_time" // condition
-    );
-
-    alias PingWalker6 = Walker!(DHTNode,
-        (a){if(DHTBootserver.well_filled6) a.send_ping(); else  { a.send_find_node(DHTtid("fn", 0), DHTId.random, DHT.want); a.pinged();}}, // action
-	"!a.is_good && a.last_pinged <= DHT.now - DHTBootserver.globals_bs.bucket_max_ping_time" // condition
-    );
-
-
+    static DHTProtocol want_by_fill = DHTProtocol.want46; // protocols which need new nodes
     
+    alias PingWalker = Walker!(DHTNode,
+        (a){ // action
+	    if(DHTBootserver.want_by_fill == DHTProtocol.nowant) 
+	        a.send_ping(); 
+	    else { 
+	        a.send_find_node(DHTtid("fn", 0), DHTId.random, want_by_fill); 
+		a.pinged();
+	    }
+	}, 
+	"!a.is_good && a.last_pinged <= DHT.now - DHTBootserver.globals_bs.bucket_max_ping_time" // condition
+    );
+
     alias NodeCollector = Collector!(DHTNode, ubyte[],
-	"a.id.id ~ to_blob(a.address)", // action
+	"a.id.id ~ to_blob(a.address)", // collect append expression
 	"a.is_good",                    // collect condition
 	"!a.is_mature && a.bucket.nodes.first.is_mature" // reset condition
     );
@@ -96,19 +100,22 @@ class DHTBootserver : DHT {
 	globals.scheduler_bucket_maintenance        = 99999;
 	globals.bucket_cache_size     = globals_bs.bucket_cache_size;
 	globals.bucket_max_num        = globals_bs.bucket_max_num;
+	globals.bucket_lock_good_id_nodes = globals_bs.bucket_lock_good_id_nodes;
 	
         super(myID, myID, sock4, sock6,(tp,id,ad){});
 
-        ping_walker4 = PingWalker4(&info.buckets.first.nodes);
-        ping_walker6 = PingWalker6(&info6.buckets.first.nodes);
+        ping_walker4 = PingWalker(&info.buckets.first.nodes);
+        ping_walker6 = PingWalker(&info6.buckets.first.nodes);
 	
         collector4 = NodeCollector(&info.buckets.first.nodes);
 	collector6 = NodeCollector(&info6.buckets.first.nodes);
 	
         scheduler.add(ScheduleType.random_search, () { new_search(DHTId.random); },
             globals_bs.scheduler_random_search, 0);
-        scheduler.add(ScheduleType.ping_walker, () { ping_walker4.walk(32); ping_walker6.walk(32);}  ,
+        scheduler.add(ScheduleType.ping_walker, () { ping_walker4.walk(globals_bs.walker_steps); ping_walker6.walk(globals_bs.walker_steps);}  ,
             globals_bs.scheduler_ping_walker, globals_bs.scheduler_ping_walker);
+	
+	want_by_fill = DHT.want;
 	
     }
     
@@ -356,6 +363,16 @@ class DHTBootserver : DHT {
 		
         // Adjust watermark
 	pinfo.is_v6 ? well_filled6 : well_filled4 = ((100 * pinfo.buckets.first.nodes.num ) / globals.bucket_size) >= globals_bs.well_filled_percentage;
+	// Adjust want depending on watermark: If other network is already well-filled,
+	// don't ask for it anymore.
+
+	want_by_fill = DHTProtocol.nowant;
+	if(!well_filled6) 
+	    want_by_fill |= DHT.want & DHTProtocol.want6;
+	if(!well_filled4) 
+	    want_by_fill |= DHT.want & DHTProtocol.want4;
+	    
+	fLog.trace("ping/send_peers policy set to ",want_by_fill," global want is ",DHT.want);    
     }
     //
     // Depending on the age of nodes, be more gentle to them:
