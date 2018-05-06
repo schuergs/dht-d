@@ -37,6 +37,7 @@ import std.conv                 : hexString, to;
 import std.array                : array, appender, join;
 import std.ascii                : isPrintable, isDigit;
 import std.algorithm            : sort, find, topN, min, max, map;
+import std.meta;
 import std.random               : uniform;
 import std.experimental.logger  : Logger, FileLogger;
 import std.digest.md            : MD5;
@@ -46,7 +47,6 @@ import core.stdc.stdlib         : strtol;
 import core.stdc.string         : memcmp;
 import core.sys.posix.arpa.inet : htons, htonl, ntohs, ntohl;
 import core.sys.posix.netinet.in_ : sockaddr_in, sockaddr_in6; 
-
 
 static Logger fLog;
 
@@ -105,6 +105,7 @@ class DHT {
         uint scheduler_rehash = 3600;                       // Re-hash all internal tables
         uint storage_return_results = 50;                   // Max addresses to return to get_peers query
         uint storage_expiry = 1800;                         // Delete a storage address after
+        uint storage_min_common_bits = 12;                  // Announced item must share at least x bits with own ID - spam protection
         uint sybil_max_num_ids = 3;                         // How many IDs an address may display before considered a sybil
         uint throttling_max_bucket = 400;                   // Maximum threshold tokens
         uint throttling_per_sec = 100;                      // Throttling per second	
@@ -151,6 +152,7 @@ class DHT {
 	const uint ip_voting_size = 8;
 	uint ip_voting_num=0;
 	ubyte[][ip_voting_size] own_ip_vote;
+	bool[ubyte[]] has_voted;
 	
         bool is_v6;
 	uint parsed_recv = 0;               // messages successfully parsed - also needed for num_nodes
@@ -258,6 +260,7 @@ class DHT {
         DHTProtocol want;
         ubyte[] ttid;
 	ubyte[] own_ip;
+        int implied_port=0;
         string toString() {
             return "message: " ~ to!string(message) ~ 
                 "\ntid: " ~ (tid.length == 4 ? DHTtid(tid).toString : to!string(tid)) ~ 
@@ -269,7 +272,7 @@ class DHT {
                 "\nwant: " ~ to!string(want) ~ 
                 "\ntoken: " ~ to!string(token.length) ~ 
                 " values: " ~ to!string(values.length) ~ " values6: " ~ to!string(values6.length);
-        }
+	}
     }
 
     private struct idStorage {
@@ -813,13 +816,10 @@ class DHT {
 		// nodes for the other network.	A boot search is network-specific.
                 if (want == DHTProtocol.want46 && !s.is_boot_search) {
                     auto opinfo = other_pinfo(pinfo);
-                    if (opinfo is null) {
-                        fLog.warning("  No twin search in other network: ", wm.tid);
-                        break;
-                    }
+                    assert(opinfo !is null);
                     auto os = find_search(opinfo, thistid);
                     if (os is null) {
-			fLog.warning("");
+                        fLog.warning("  No twin search in other network: ", wm.tid);
                         break;
                     }
                     if (is_v6) {
@@ -892,7 +892,7 @@ class DHT {
 	
 	// Perform check of our own IP
 	if(wm.own_ip.length > 0)
-	    ip_check(pinfo,wm.own_ip);
+	    ip_check(pinfo,wm.own_ip,from);
 
     }
 
@@ -923,6 +923,7 @@ class DHT {
         const FieldMapCallback[string] FieldMap = [
 	    "info_hash" : (s,sl,i){ if(s.length == 20) wm.info_hash = DHTId(s);},
 	    "port"      : (s,sl,i){ wm.port    = to!ushort(i);},
+	    "implied_port" : (s,sl,i){ wm.implied_port = to!ushort(i);},
 	    "target"    : (s,sl,i){ if(s.length == 20) wm.target = DHTId(s);},
 	    "token"     : (s,sl,i){ wm.token   = s;},
 	    "nodes"     : (s,sl,i){ nodes      = s;},
@@ -1071,8 +1072,8 @@ class DHT {
             }
             wm.nodes6 = n6blob.data.dup;
 
-
-	    // Some boot servers 
+            if(wm.implied_port != 0)
+	        wm.port = 0;
 	    
         }	    
         // Something went wrong
@@ -1639,25 +1640,27 @@ class DHT {
     // Store an announced address. Addresses with the youngest announce time are 
     // at the back of the storage (simplifies cleanup)
     private void storage_store(DHTInfo* pinfo, DHTId info_hash, Address from, ushort port, DHTId sender_id) {
-        if (port == 0)
-            return; // silently ignore junk port
-
         AddressBlob blob = to_addressblob(from);
 
-	
-        if (pinfo.is_v6)
-            blob.port6 = htons(port);
-        else
-            blob.port4 = htons(port);
+	if(port != 0){ // port = 0 means implied port - see https://github.com/webtorrent/bittorrent-dht/issues/95
+            if (pinfo.is_v6)
+                blob.port6 = htons(port);
+            else
+                blob.port4 = htons(port);
+	}
 
         if(!is_id_by_ip(sender_id, pinfo.is_v6 ? blob.ablob6 : blob.ablob4)){
             fLog.trace("Announcing ID ", sender_id," does not match IP, silently ignoring.");
 	    return;
 	}
 	
-	    
-	    
-	    
+	int cb = info_hash.common_bits(pinfo.myid);
+	if(cb < globals.storage_min_common_bits){
+	    fLog.info("Rogue announce_peer for distant item (",cb," common bits), blacklisted");
+	    blacklist(from,"announce_peer SPAM");
+	    return;
+	}
+	
         fLog.trace(from, " announces ", info_hash, " at port ", port);
 
         idStorage* ids;
@@ -2542,7 +2545,7 @@ class DHT {
     // IP check:
     // This uses a "voting" mechanism which stores the last n 
     // IP responses by peers. The IP with the most votes wins.
-    protected void ip_check(DHTInfo* pinfo,ubyte[] apparent_ip){
+    protected void ip_check(DHTInfo* pinfo,ubyte[] apparent_ip, Address from){
         // remove port part & check if valid
 	switch(apparent_ip.length){
 	    case 4, 16: 
@@ -2558,18 +2561,29 @@ class DHT {
 		return;
 	    }
 
+	ubyte[] blob;
+	    
         if(pinfo.ip_voting){ // an IP vote is ongoing
+	    blob = from.to_blob;
+	    if(blob in pinfo.has_voted)
+	        return;
+	
 	    pinfo.own_ip_vote[pinfo.ip_voting_num++] = apparent_ip.dup;
 	    
 	    if(pinfo.ip_voting_num == pinfo.ip_voting_size){ // vote finished
 	        evaluate_ip_votes(pinfo);
 		pinfo.ip_voting = false;
-	    }
+	    } else
+	        pinfo.has_voted[cast(immutable(ubyte[])) blob] = true;
+	    
 	} else if(apparent_ip != pinfo.own_ip){ // Start new vote
+	    pinfo.has_voted.clear;
 	    fLog.trace("New " ~ (pinfo.is_v6 ? "IPv6" : "IPv4" ) ~ " vote started - someone thinks we're " ~ to_address(apparent_ip).toAddrString());
 	    pinfo.ip_voting_num = 1;
             pinfo.ip_voting = true;
             pinfo.own_ip_vote[0] = apparent_ip.dup;	    
+	    blob = from.to_blob;
+	    pinfo.has_voted[cast(immutable(ubyte[])) blob] = true;
 	}
     }
     protected void evaluate_ip_votes(DHTInfo* pinfo){
@@ -2881,20 +2895,24 @@ class DHTNode {
 
 	ubyte[] blob = a.to_blob();
 	
-        auto msg = appender!(ubyte[])();
-        msg ~= head ;
-	msg ~= pinfo.myid.id[];
-	msg ~= (blob.length == 6 ? "e2:ip6:".representation : "e2:ip18:".representation);
-        msg ~= blob;
-	msg ~= tail;
+        enum string msg_code = 
+            addDict!(""
+                ~addKeyDict!("a",
+	            addKeyStringExp!("id","pinfo.myid.id") // ...Exp for quoted expressions
+	        )
+	        ~addKeyString!("ip",blob)
+	        ~addKeyString!("q","ping")
+	        ~addKeyString!("t","pn\x00\x00")
+	        ~addKeyString!("y","q")
+            );
 	
-        s.sendTo(msg.data, cast(SocketFlags) 0, a);
+	ubyte[] msg = mixin(BEncodeHead ~ msg_code ~ BEncodeTail);
+	
+        s.sendTo(msg, cast(SocketFlags) 0, a);
         version (statistics)
-            update_statistics(s, msg.data.length);
-	version(protocol_trace){
-	    fLog.info("Outgoing:\n",to_ascii(msg.data,true));
-	    fLog.info("Outgoing:\n",bencode2ascii(msg.data));
-	}
+            update_statistics(s, msg.length);
+	version(protocol_trace)
+	    fLog.info("Outgoing:\n",bencode2ascii(msg));
     }
 
     public static void send_find_node(DHT.DHTInfo* pinfo, DHTtid tid, DHTId target,
@@ -2906,23 +2924,26 @@ class DHTNode {
 
 	ubyte[] blob = address.to_blob();
 	
-        auto msg = appender!(ubyte[])();
-        msg ~= part1;
-        msg ~= pinfo.myid.id[];
-        msg ~= part2;
-        msg ~= target.id[];
-        msg ~= wantchoice[want];
-	msg ~= (blob.length == 6 ? "e2:ip6:".representation : "e2:ip18:".representation);
-        msg ~= blob;
-        msg ~= part3;
-        msg ~= tid.tid[];
-        msg ~= part4;
+        enum string msg_code = 
+            addDict!(""
+                ~addKeyDict!("a",""
+	            ~addKeyStringExp!("id","pinfo.myid.id")
+	            ~addKeyStringExp!("target","target.id")
+		    ~addRawExp!("wantchoice[want]")
+	        )
+	        ~addKeyString!("ip",blob)
+	        ~addKeyString!("q","find_node")
+	        ~addKeyStringExp!("t","tid.tid")
+	        ~addKeyString!("y","q")
+            );
 
-        pinfo.s.sendTo(msg.data, cast(SocketFlags) 0, address);
+	ubyte[] msg = mixin(BEncodeHead ~ msg_code ~ BEncodeTail);
+
+        pinfo.s.sendTo(msg, cast(SocketFlags) 0, address);
         version (statistics)
-            update_statistics(pinfo, msg.data.length);
+            update_statistics(pinfo, msg.length);
 	version(protocol_trace)
-	    fLog.info("Outgoing:\n",bencode2ascii(msg.data));
+	    fLog.info("Outgoing:\n",bencode2ascii(msg));
     }
 
     public static void send_announce_peer(DHT.DHTInfo* pinfo, Address address,
@@ -2936,28 +2957,27 @@ class DHTNode {
 
 	ubyte[] blob = address.to_blob();
 	
-        auto msg = appender!(ubyte[])();
-        msg ~= part1;
-        msg ~= pinfo.myid.id[];
-        msg ~= part2;
-        msg ~= info_hash.id[];
-        msg ~= part3;
-        msg ~= cast(ubyte[]) to!string(port);
-        msg ~= part4;
-        msg ~= cast(ubyte[]) to!string(token.length);
-        msg ~= ':';
-        msg ~= token;
-	msg ~= (blob.length == 6 ? "e2:ip6:".representation : "e2:ip18:".representation);
-        msg ~= blob;
-        msg ~= part5;
-        msg ~= tid.tid[];
-        msg ~= part6;
+        enum string msg_code = 
+            addDict!(""
+                ~addKeyDict!("a",""
+	            ~addKeyStringExp!("id","pinfo.myid.id")
+	            ~addKeyStringExp!("info_hash","info_hash.id")
+		    ~addKeyInt!("port",port)
+	            ~addKeyString!("token",token)
+	        )
+	        ~addKeyString!("ip",blob)
+	        ~addKeyString!("q","announce_peer")
+	        ~addKeyStringExp!("t","tid.tid")
+	        ~addKeyString!("y","q")
+            );
 
-        pinfo.s.sendTo(msg.data, cast(SocketFlags) 0, address);
+	ubyte[] msg = mixin(BEncodeHead ~ msg_code ~ BEncodeTail);
+	    
+        pinfo.s.sendTo(msg, cast(SocketFlags) 0, address);
         version (statistics)
-            update_statistics(pinfo, msg.data.length);
+            update_statistics(pinfo, msg.length);
 	version(protocol_trace)
-	    fLog.info("Outgoing:\n",bencode2ascii(msg.data));
+	    fLog.info("Outgoing:\n",bencode2ascii(msg));
     }
 
     public void send_find_node(DHTtid tid, DHTId target, DHTProtocol want) {
@@ -2973,23 +2993,26 @@ class DHTNode {
 
 	ubyte[] blob = address.to_blob();
 	
-        auto msg = appender!(ubyte[])();
-        msg ~= part1;
-        msg ~= pinfo.myid.id[];
-        msg ~= part2;
-        msg ~= info_hash.id[];
-        msg ~= wantchoice[want];
-	msg ~= (blob.length == 6 ? "e2:ip6:".representation : "e2:ip18:".representation);
-        msg ~= blob;
-        msg ~= part3;
-        msg ~= tid.tid[];
-        msg ~= part4;
+        enum string msg_code = 
+            addDict!(""
+                ~addKeyDict!("a",""
+	            ~addKeyStringExp!("id","pinfo.myid.id")
+	            ~addKeyStringExp!("info_hash","info_hash.id")
+		    ~addRawExp!("wantchoice[want]")
+	        )
+	        ~addKeyString!("ip",blob)
+	        ~addKeyString!("q","get_peers")
+	        ~addKeyStringExp!("t","tid.tid")
+	        ~addKeyString!("y","q")
+            );
 
-        pinfo.s.sendTo(msg.data, cast(SocketFlags) 0, address);
+	ubyte[] msg = mixin(BEncodeHead ~ msg_code ~ BEncodeTail);
+	    
+        pinfo.s.sendTo(msg, cast(SocketFlags) 0, address);
         version (statistics)
-            update_statistics(pinfo, msg.data.length);
+            update_statistics(pinfo, msg.length);
 	version(protocol_trace)
-	    fLog.info("Outgoing:\n",bencode2ascii(msg.data));
+	    fLog.info("Outgoing:\n",bencode2ascii(msg));
     }
 
     public alias send_closest_nodes = send_nodes_peers; // identical
@@ -3013,64 +3036,53 @@ class DHTNode {
         if (want & DHTProtocol.want6)
             nodes6 = DHT.get_instance.gather_closest_nodes_for_reply(&DHT.info6, target, 8);
 
-        static const ubyte[] part0 = "d2:ip".representation;
-        static const ubyte[] part1 = "1:rd2:id20:".representation;
-        static const ubyte[] part2 = "6:valuesl".representation;
-        static const ubyte[] part3 = "e".representation;
-        static const ubyte[] part4 = "1:y1:re".representation;
-
-        auto msg = appender!(ubyte[])();
-
-        msg ~= part0;
-	msg ~= (blob.length == 6 ? "6:".representation : "18:".representation);
-        msg ~= blob;
-	
-	
-        msg ~= part1;
-        msg ~= pinfo.myid.id[];
-        if (nodes.length > 0) {
-            msg ~= cast(ubyte[])("5:nodes" ~ to!string(nodes.length) ~ ":");
-            msg ~= nodes;
-        }
-        if (nodes6.length > 0) {
-            msg ~= cast(ubyte[])("6:nodes6" ~ to!string(nodes6.length) ~ ":");
-            msg ~= nodes6;
-        }
-        if (token.length > 0) {
-            msg ~= cast(ubyte[])("5:token" ~ to!string(token.length) ~ ":");
-            msg ~= token;
-        }
+	// All entries are the same size, so we're building the list manually
+	ubyte[] peersarr;
         if (peers.length > 0) {
-            ushort entrylen = pinfo.is_v6 ? 18 : 6;
-            ubyte[] len_header = cast(ubyte[]) to!string(entrylen) ~ ':';
-
+            ushort entrylen;
+            ubyte[] len_header;
+	    if(pinfo.is_v6){
+	        entrylen = 18;
+		len_header = cast(ubyte[]) "18:";
+	    } else {
+	        entrylen = 6;
+		len_header = cast(ubyte[]) "6:";
+            }	
+	
+            peersarr.reserve(256);
+	    
             fLog.info(
                 "  Sent " ~ to!string(peers.length / entrylen) ~ " " ~ (pinfo.is_v6 ? "IPV6"
                 : "IPV4") ~ " peers");
 
-            msg ~= part2;
-
             while (peers.length > 0) {
-                msg ~= len_header;
-                msg ~= peers[0 .. entrylen];
+                peersarr ~= len_header;
+                peersarr ~= peers[0 .. entrylen];
                 peers = peers[entrylen .. $];
             }
+        }	    
+	    
+        enum string msg_code = 
+            addDict!(""
+	        ~addKeyString!("ip",blob)
+                ~addKeyDict!("r",""
+	            ~addKeyStringExp!("id","pinfo.myid.id")
+		    ~addIf!("nodes.length > 0",addKeyString!("nodes",nodes))
+		    ~addIf!("nodes6.length > 0",addKeyString!("nodes6",nodes6))
+		    ~addIf!("token.length > 0",addKeyString!("token",token))
+		    ~addIf!("peersarr.length > 0",addString!("values")~addRaw!("l")~addRaw!(peersarr)~addRaw!("e"))
+	        )
+	        ~addKeyString!("t",tid)
+	        ~addKeyString!("y","r")
+            );
 
-            msg ~= part3;
-        }
-
-        msg ~= cast(ubyte[])("e1:t" ~ to!string(tid.length) ~ ":");
-        msg ~= tid;
-        msg ~= part4;
-
-        fLog.info(
-            "  Sent (" ~ to!string(nodes.length / 26) ~ "+" ~ to!string(nodes6.length / 38) ~ ") nodes");
-
-        pinfo.s.sendTo(msg.data, cast(SocketFlags) 0, address);
+	ubyte[] msg = mixin(BEncodeHead ~ msg_code ~ BEncodeTail);
+	
+        pinfo.s.sendTo(msg, cast(SocketFlags) 0, address);
         version (statistics)
-            update_statistics(pinfo, msg.data.length);
+            update_statistics(pinfo, msg.length);
 	version(protocol_trace)
-	    fLog.info("Outgoing:\n",bencode2ascii(msg.data));
+	    fLog.info("Outgoing:\n",bencode2ascii(msg));
     }
 
     version (statistics) {
@@ -3105,30 +3117,24 @@ class DHTNode {
     public alias send_pong = send_peer_announced;
 
     public static void send_peer_announced(DHT.DHTInfo* pinfo, Address address, ubyte[] tid) {
-        static const ubyte[] part0 = "d2:ip".representation;
-        static const ubyte[] part1 = "1:rd2:id20:".representation;
-        static const ubyte[] part2 = "1:y1:re".representation;
-        auto msg = appender!(ubyte[])();
-
 	ubyte[] blob = address.to_blob();
+        enum string msg_code = 
+            addDict!(""
+	        ~addKeyString!("ip",blob)
+                ~addKeyDict!("r",
+	            addKeyStringExp!("id","pinfo.myid.id") // ...Exp for quoted expressions
+	        )
+	        ~addKeyString!("t",tid)
+	        ~addKeyString!("y","r")
+            );
 
-        msg ~= part0;
-	msg ~= cast(ubyte[]) to!string(blob.length);
-	msg ~= ':';
-        msg ~= blob;
+	ubyte[] msg = mixin(BEncodeHead ~ msg_code ~ BEncodeTail);
 	
-        msg ~= part1;
-        msg ~= pinfo.myid.id[];
-
-        msg ~= cast(ubyte[])("e1:t" ~ to!string(tid.length) ~ ":");
-        msg ~= tid;
-        msg ~= part2;
-
-        pinfo.s.sendTo(msg.data, cast(SocketFlags) 0, address);
+        pinfo.s.sendTo(msg, cast(SocketFlags) 0, address);
         version (statistics)
-            update_statistics(pinfo, msg.data.length);
+            update_statistics(pinfo, msg.length);
 	version(protocol_trace)
-	    fLog.info("Outgoing:\n",bencode2ascii(msg.data));
+	    fLog.info("Outgoing:\n",bencode2ascii(msg));
     }
 
     public void pinged() {
@@ -3810,6 +3816,186 @@ static bool is_id_by_ip(DHTId id, ubyte[] ip){
     return is_id == should_id;
 }
     
+// BEncode templates: Create efficient, yet readable and maintainable code for BEncode messages.
+// Unrolls deep structures into a "mixin" chained expression which enable the optimiser to 
+// concatenate neighbouring constant strings. 
+//
+// Sample "ping" message:
+//
+//    enum string msg_code = 
+//        addDict!(
+//            addKeyDict!("a",
+//	        addKeyStringExp!("id","mynetwork.id") // ...Exp for quoted expressions
+//	    )
+//	    ~addKeyString!("ip","123456") // addKey... are for dictionary entries
+//	    ~addKeyString!("q","ping")
+//	    ~addKeyString!("t","pn01")
+//	    ~addKeyString!("y","q")
+//        );
+//
+//    ubyte[] msg = mixin(BEncodeHead ~ msg_code ~ BEncodeTail);
+//     
+    
+
+// Head & tail literals for mixin();
+enum BEncodeHead = `cast(ubyte[]) (""`;
+enum BEncodeTail = ")";
+
+// Add an int - literal, constant or simple variable
+template addInt(alias val)
+if(is(typeof(val) : int))
+{
+   static if(isIntConst!(val)){
+       enum int int_lit = Alias!(val+0); // Convert constant name to value literal
+       enum string addInt = `~ "i` ~ int_lit.stringof ~ `e"`;
+   } else {
+       enum string addInt = "~ 'i' ~ to!string(" ~ val.stringof ~ ") ~ 'e'";
+   }
+}
+
+// Add an int expression supplied as a quoted string, such as "a+1" or "mystruct.a"
+template addIntExp(string val)
+{
+    static assert(!__traits(compiles,Alias!(mixin(val)+0)),`addIntExp("`~val~`"): "`~val~`" is a constant expression. use addInt(`~val~`) instead.`);
+    enum string addIntExp = "~ 'i' ~ to!string(" ~ val ~ ") ~ 'e'";
+}
+
+// Add a string or ubyte[] array - literal, constant or simple variable
+template addString(alias val)
+if(isStringArr!(val) || isUbyteArr!(val)) // Cannot simply cast to string if val is a variable.
+{
+   static if(isStringConst!(val) || isUbyteConst!(val)){
+        alias sval = Alias!((cast(string) val)~"");
+        enum s = '`' ~ addString_escapeQuotes!(sval) ~ '`';
+   } else static if(isUbyteArr!(val)) {
+        alias sval = val;
+        enum s = "cast(string) " ~ val.stringof;
+   } else {
+        alias sval = val;
+        enum s = val.stringof;
+   } 
+
+   static if(isStaticArrayLen!(sval)){ // isStaticArray doesn't work here
+       enum int slen = sval.length;
+       enum string len = '\"' ~ slen.stringof ~ ":\"";
+   } else
+       enum string len = "to!string(" ~ sval.stringof ~ ".length) ~ ':'";
+	
+   enum string addString = "~ " ~ len ~ " ~ " ~ s ~ " ";
+}
+
+// Add a string expression supplied as a quoted string, such as "a+1" or "mystruct.a"
+template addStringExp(string val)
+{
+    static assert(!__traits(compiles,Alias!(mixin(val)~0)),`addStringExp("`~val~`"): "`~val~`" is a constant expression. use addString(`~val~`) instead.`);
+    enum string addStringExp = `~ (__traits(compiles,Alias!((`~val~`).length)) ? intLiteralOf!((`~val~`).length.stringof) : to!string((`~val~`).length) ) ~ ':' ~ cast(string) `~val~" ";
+}
+
+// String literals or constants may contain backtick quotes
+template addString_escapeQuotes(alias str)
+if(isStringConst!(str)){
+    static if(str.length == 0)
+        enum string addString_escapeQuotes = "";
+    else static if(str[0] < 32 || str[0] > 127 || str[0] == '`'){
+        enum char c = str[0];
+        enum string addString_escapeQuotes = "` ~ " ~ c.stringof ~ " ~ `" ~ addString_escapeQuotes!(str[1..$]);
+    }else
+        enum string addString_escapeQuotes = str[0] ~ addString_escapeQuotes!(str[1..$]);
+}
+
+// Add a dictionary
+template addDict(alias val)
+if(isStringConst!(val)) {
+    enum string addDict = "~ 'd' " ~ val ~ " ~ 'e' " ;
+}
+
+// Add a list - currently, only lists of strings  are supported.
+template addList(alias val)
+if(isStringArrArr!(val) || isUbyteArrArr!(val)) {
+    static if(isStaticArrayLen!(val))
+        enum string addList = "~ 'l' " ~ addList_flattenConstantLengthArr!(val) ~ " ~ 'e' ";
+    else
+        //enum string addList = "~ 'l' ~ " ~ val.stringof ~ ".map!(a => to!string(a.length) ~ ':' ~ cast(string)a ).join() ~ 'e' ";
+        enum string addList = "~ 'l' ~ addList_flattenFlexLengthArr(" ~ val.stringof ~ ") ~ 'e' ";
+}
+
+// If the supplied array is of constant length, flatten it.
+template addList_flattenConstantLengthArr(alias arr,int idx=0)
+ {
+    static if(arr.length == 0 || idx >= arr.length)
+        enum string addList_flattenConstantLengthArr = "";
+    else static if(__traits(compiles, addString!(arr[0])))	
+        enum string addList_flattenConstantLengthArr = addString!(arr[0]) ~ addList_flattenConstantLengthArr!(arr[1..$],idx+1);
+    else
+        enum string addList_flattenConstantLengthArr = mixin(`addStringExp!("` ~ arr.stringof ~ "[" ~ idx.stringof ~ `]") `)  ~ addList_flattenConstantLengthArr!(arr,idx+1);
+}
+
+// This should be faster than doing arr.map!(a => to!string(a.length) ~ ':' ~ cast(string)a ).join()
+string addList_flattenFlexLengthArr(T)(T arr)
+if(isStringArrArr!(arr) || isUbyteArrArr!(arr)) {
+    string a;
+    a.reserve(512);
+    foreach(s;arr)
+        a ~= mixin(`""` ~ addString!(s));
+    return a;
+}
+
+// Add some raw code, such as pre-calculated code chunks
+template addRaw(alias val)
+if(isStringArr!(val) || isUbyteArr!(val)) 
+{
+    static if(isUbyteConst!(val) || isStringConst!(val)){
+        enum sval = Alias!((cast(string) val)~"");
+        enum string addRaw = "~ `" ~ addString_escapeQuotes!(sval) ~ "` " ;
+    } else static if(isUbyteArr!(val))
+        enum string addRaw = "~ cast(string) " ~ val.stringof ~ " ";
+    else
+        enum string addRaw = "~ " ~ val.stringof ~ " ";
+}
+
+template addRawExp(string val)
+{
+    static assert(!__traits(compiles,Alias!(mixin(val)~0)),`addRawExp("`~val~`"): "`~val~`" is a constant expression. use addRaw(`~val~`) instead.`);
+    enum string addRawExp = "~ cast(string) " ~ val ~ " ";
+}
+
+// Conditional add
+template addIf(string condition,string iftrue,string iffalse = ""){
+    enum string addIf="~ ((" ~ condition ~ ") ? ``" ~ iftrue ~ " : ``" ~ iffalse ~ ") ";
+}    
+
+// Convert "20LU" to "20"
+template intLiteralOf(string s){
+    static if(s.length == 0)
+        enum string intLiteralOf = s;
+    else static if(s[$-1] > '9')
+        enum string intLiteralOf = intLiteralOf!(s[0..$-1]);
+    else
+        enum string intLiteralOf = s;
+}
+
+
+// Convenience functions for dictionaries
+enum addKeyString(alias key,alias val)     = addString!(key) ~ addString!(val);
+enum addKeyStringExp(alias key,string val) = addString!(key) ~ addStringExp!(val);
+enum addKeyInt(alias key,alias val)        = addString!(key) ~ addInt!(val);
+enum addKeyIntExp(alias key,string val)    = addString!(key) ~ addIntExp!(val);
+enum addKeyDict(alias key,alias val)       = addString!(key) ~ addDict!(val);
+enum addKeyList(alias key,alias val)       = addString!(key) ~ addList!(val);
+enum addKeyRaw(alias key,alias val)        = addString!(key) ~ addRaw!(val);
+enum addKeyRawExp(alias key,string val)    = addString!(key) ~ addRawExp!(val);
+
+// Conditions
+enum isIntConst(alias val)       = is(typeof(val) : int) && __traits(compiles,Alias!(val+0));
+enum isStringConst(alias val)    = isStringArr!(val) && __traits(compiles,Alias!(val~""));
+enum isUbyteConst(alias val)     = isUbyteArr!(val) && __traits(compiles,Alias!(val~0));
+enum isStringArr(alias val)      = is(Unqual!(typeof(val)) == string) || (is(typeof(val) : A[], A) && is(Unqual!A == char));
+enum isUbyteArr(alias val)       = is(typeof(val) : A[], A) && is(Unqual!A == ubyte);
+enum isStringArrArr(alias val)   = is(typeof(val) : A[], A) && (is(Unqual!A == string) || (is(A : B[], B) && is(Unqual!B == char)));
+enum isUbyteArrArr(alias val)    = is(typeof(val) : A[], A) && is(A : B[], B) && is(Unqual!B == ubyte);
+enum isStaticArrayLen(alias val) = __traits(compiles,Alias!(val.length+0));
+
+
 
 
 	
