@@ -32,7 +32,7 @@ core behaviour to:
 ---------------
 As per security enhancement described in https://libtorrent.org/dht_sec.html, 
 client IDs can no longer be freely chosen, but need to be tied to the client's
-public email address. The aim of this restriction is to avoid Sybil attacks.
+public IP address. The aim of this restriction is to avoid Sybil attacks.
 Client functionality includes:
 
 * Extensions to protocol ("ip" field in control protocol):
