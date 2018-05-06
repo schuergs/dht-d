@@ -191,6 +191,15 @@ combination due to NATing. The Sybil watchlist will tolerate different IDs for
 the same address up to a configurable threshold (default: 3). Only if the
 threshold is exceeded, the address is blacklisted. 
 
+Other protection against malicious behaviour
+--------------------------------------------
+
+* announce_peer distance restriction:
+Other nodes may not perform announce_peer for arbitrary info hashes; the 
+announced info_hash and our own ID must share a minimum number of bits
+(default: 12). Announcing info hashes with less common bits results
+in blacklisting.
+
 
 Final remarks
 -------------

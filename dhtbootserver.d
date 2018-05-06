@@ -270,7 +270,7 @@ class DHTBootserver : DHT {
 
 	// Perform check of our own IP
 	if(wm.own_ip.length > 0)
-	    ip_check(pinfo,wm.own_ip);
+	    ip_check(pinfo,wm.own_ip,from);
 
     }
 

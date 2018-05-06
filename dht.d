@@ -152,6 +152,7 @@ class DHT {
 	const uint ip_voting_size = 8;
 	uint ip_voting_num=0;
 	ubyte[][ip_voting_size] own_ip_vote;
+	bool[ubyte[]] has_voted;
 	
         bool is_v6;
 	uint parsed_recv = 0;               // messages successfully parsed - also needed for num_nodes
@@ -891,7 +892,7 @@ class DHT {
 	
 	// Perform check of our own IP
 	if(wm.own_ip.length > 0)
-	    ip_check(pinfo,wm.own_ip);
+	    ip_check(pinfo,wm.own_ip,from);
 
     }
 
@@ -2544,7 +2545,7 @@ class DHT {
     // IP check:
     // This uses a "voting" mechanism which stores the last n 
     // IP responses by peers. The IP with the most votes wins.
-    protected void ip_check(DHTInfo* pinfo,ubyte[] apparent_ip){
+    protected void ip_check(DHTInfo* pinfo,ubyte[] apparent_ip, Address from){
         // remove port part & check if valid
 	switch(apparent_ip.length){
 	    case 4, 16: 
@@ -2560,18 +2561,29 @@ class DHT {
 		return;
 	    }
 
+	ubyte[] blob;
+	    
         if(pinfo.ip_voting){ // an IP vote is ongoing
+	    blob = from.to_blob;
+	    if(blob in pinfo.has_voted)
+	        return;
+	
 	    pinfo.own_ip_vote[pinfo.ip_voting_num++] = apparent_ip.dup;
 	    
 	    if(pinfo.ip_voting_num == pinfo.ip_voting_size){ // vote finished
 	        evaluate_ip_votes(pinfo);
 		pinfo.ip_voting = false;
-	    }
+	    } else
+	        pinfo.has_voted[cast(immutable(ubyte[])) blob] = true;
+	    
 	} else if(apparent_ip != pinfo.own_ip){ // Start new vote
+	    pinfo.has_voted.clear;
 	    fLog.trace("New " ~ (pinfo.is_v6 ? "IPv6" : "IPv4" ) ~ " vote started - someone thinks we're " ~ to_address(apparent_ip).toAddrString());
 	    pinfo.ip_voting_num = 1;
             pinfo.ip_voting = true;
             pinfo.own_ip_vote[0] = apparent_ip.dup;	    
+	    blob = from.to_blob;
+	    pinfo.has_voted[cast(immutable(ubyte[])) blob] = true;
 	}
     }
     protected void evaluate_ip_votes(DHTInfo* pinfo){
@@ -2883,44 +2895,24 @@ class DHTNode {
 
 	ubyte[] blob = a.to_blob();
 	
-        auto msg = appender!(ubyte[])();
-        msg ~= head ;
-	msg ~= pinfo.myid.id[];
-	msg ~= (blob.length == 6 ? "e2:ip6:".representation : "e2:ip18:".representation);
-        msg ~= blob;
-	msg ~= tail;
+        enum string msg_code = 
+            addDict!(""
+                ~addKeyDict!("a",
+	            addKeyStringExp!("id","pinfo.myid.id") // ...Exp for quoted expressions
+	        )
+	        ~addKeyString!("ip",blob)
+	        ~addKeyString!("q","ping")
+	        ~addKeyString!("t","pn\x00\x00")
+	        ~addKeyString!("y","q")
+            );
 	
-        s.sendTo(msg.data, cast(SocketFlags) 0, a);
+	ubyte[] msg = mixin(BEncodeHead ~ msg_code ~ BEncodeTail);
+	
+        s.sendTo(msg, cast(SocketFlags) 0, a);
         version (statistics)
-            update_statistics(s, msg.data.length);
-	version(protocol_trace){
-	    fLog.info("Outgoing_old:\n",to_ascii(msg.data,true));
-	    fLog.info("Outgoing_old:\n",bencode2ascii(msg.data));
-            enum string msg_code = 
-                addDict!(""
-                    ~addKeyDict!("a",
-	                addKeyStringExp!("id","pinfo.myid.id") // ...Exp for quoted expressions
-	            )
-	            ~addKeyString!("ip",blob)
-	            ~addKeyString!("q","ping")
-	            ~addKeyString!("t","pn\x00\x00")
-	            ~addKeyString!("y","q")
-                );
-
-	    if(mixin(BEncodeHead ~ msg_code ~ BEncodeTail) == msg.data)
-                fLog.info("OK, old and new message are identical.");
-            else
-                fLog.info("BROKEN, old and new message are NOT identical.","\nold/new:\n",to_ascii(msg.data,true),"\n",to_ascii(mixin(BEncodeHead ~ msg_code ~ BEncodeTail),true),"\n\nMixin:\n",BEncodeHead ~ msg_code ~ BEncodeTail);
-	    
-		
-	    //template say(string s){
-		//enum string say = s ~ " Compiles=" ~ (__traits(compiles,mixin(s)) ? "true" : "false") ~ (__traits(compiles,mixin(s)) ? " = " ~ mixin(s) : "");
-	    //}
-	    //pragma(msg,say!`addString!("jaja")`);
-
-
-	    
-	}
+            update_statistics(s, msg.length);
+	version(protocol_trace)
+	    fLog.info("Outgoing:\n",bencode2ascii(msg));
     }
 
     public static void send_find_node(DHT.DHTInfo* pinfo, DHTtid tid, DHTId target,
@@ -2932,41 +2924,26 @@ class DHTNode {
 
 	ubyte[] blob = address.to_blob();
 	
-        auto msg = appender!(ubyte[])();
-        msg ~= part1;
-        msg ~= pinfo.myid.id[];
-        msg ~= part2;
-        msg ~= target.id[];
-        msg ~= wantchoice[want];
-	msg ~= (blob.length == 6 ? "e2:ip6:".representation : "e2:ip18:".representation);
-        msg ~= blob;
-        msg ~= part3;
-        msg ~= tid.tid[];
-        msg ~= part4;
+        enum string msg_code = 
+            addDict!(""
+                ~addKeyDict!("a",""
+	            ~addKeyStringExp!("id","pinfo.myid.id")
+	            ~addKeyStringExp!("target","target.id")
+		    ~addRawExp!("wantchoice[want]")
+	        )
+	        ~addKeyString!("ip",blob)
+	        ~addKeyString!("q","find_node")
+	        ~addKeyStringExp!("t","tid.tid")
+	        ~addKeyString!("y","q")
+            );
 
-        pinfo.s.sendTo(msg.data, cast(SocketFlags) 0, address);
+	ubyte[] msg = mixin(BEncodeHead ~ msg_code ~ BEncodeTail);
+
+        pinfo.s.sendTo(msg, cast(SocketFlags) 0, address);
         version (statistics)
-            update_statistics(pinfo, msg.data.length);
-	version(protocol_trace){
-	    fLog.info("Outgoing:\n",bencode2ascii(msg.data));
-            enum string msg_code = 
-                addDict!(""
-                    ~addKeyDict!("a",""
-	                ~addKeyStringExp!("id","pinfo.myid.id")
-	                ~addKeyStringExp!("target","target.id")
-			~addRawExp!("wantchoice[want]")
-	            )
-	            ~addKeyString!("ip",blob)
-	            ~addKeyString!("q","find_node")
-	            ~addKeyStringExp!("t","tid.tid")
-	            ~addKeyString!("y","q")
-                );
-
-	    if(mixin(BEncodeHead ~ msg_code ~ BEncodeTail) == msg.data)
-                fLog.info("OK, old and new message are identical.");
-            else
-                fLog.info("BROKEN, old and new message are NOT identical.","\nold/new:\n",to_ascii(msg.data,true),"\n",to_ascii(mixin(BEncodeHead ~ msg_code ~ BEncodeTail),true),"\n\nMixin:\n",BEncodeHead ~ msg_code ~ BEncodeTail);
-	}
+            update_statistics(pinfo, msg.length);
+	version(protocol_trace)
+	    fLog.info("Outgoing:\n",bencode2ascii(msg));
     }
 
     public static void send_announce_peer(DHT.DHTInfo* pinfo, Address address,
@@ -2980,47 +2957,27 @@ class DHTNode {
 
 	ubyte[] blob = address.to_blob();
 	
-        auto msg = appender!(ubyte[])();
-        msg ~= part1;
-        msg ~= pinfo.myid.id[];
-        msg ~= part2;
-        msg ~= info_hash.id[];
-        msg ~= part3;
-        msg ~= cast(ubyte[]) to!string(port);
-        msg ~= part4;
-        msg ~= cast(ubyte[]) to!string(token.length);
-        msg ~= ':';
-        msg ~= token;
-	msg ~= (blob.length == 6 ? "e2:ip6:".representation : "e2:ip18:".representation);
-        msg ~= blob;
-        msg ~= part5;
-        msg ~= tid.tid[];
-        msg ~= part6;
+        enum string msg_code = 
+            addDict!(""
+                ~addKeyDict!("a",""
+	            ~addKeyStringExp!("id","pinfo.myid.id")
+	            ~addKeyStringExp!("info_hash","info_hash.id")
+		    ~addKeyInt!("port",port)
+	            ~addKeyString!("token",token)
+	        )
+	        ~addKeyString!("ip",blob)
+	        ~addKeyString!("q","announce_peer")
+	        ~addKeyStringExp!("t","tid.tid")
+	        ~addKeyString!("y","q")
+            );
 
-        pinfo.s.sendTo(msg.data, cast(SocketFlags) 0, address);
+	ubyte[] msg = mixin(BEncodeHead ~ msg_code ~ BEncodeTail);
+	    
+        pinfo.s.sendTo(msg, cast(SocketFlags) 0, address);
         version (statistics)
-            update_statistics(pinfo, msg.data.length);
-	version(protocol_trace){
-	    fLog.info("Outgoing:\n",bencode2ascii(msg.data));
-            enum string msg_code = 
-                addDict!(""
-                    ~addKeyDict!("a",""
-	                ~addKeyStringExp!("id","pinfo.myid.id")
-	                ~addKeyStringExp!("info_hash","info_hash.id")
-			~addKeyInt!("port",port)
-	                ~addKeyString!("token",token)
-	            )
-	            ~addKeyString!("ip",blob)
-	            ~addKeyString!("q","announce_peer")
-	            ~addKeyStringExp!("t","tid.tid")
-	            ~addKeyString!("y","q")
-                );
-
-	    if(mixin(BEncodeHead ~ msg_code ~ BEncodeTail) == msg.data)
-                fLog.info("OK, old and new message are identical.");
-            else
-                fLog.info("BROKEN, old and new message are NOT identical.","\nold/new:\n",to_ascii(msg.data,true),"\n",to_ascii(mixin(BEncodeHead ~ msg_code ~ BEncodeTail),true),"\n\nMixin:\n",BEncodeHead ~ msg_code ~ BEncodeTail);
-	}
+            update_statistics(pinfo, msg.length);
+	version(protocol_trace)
+	    fLog.info("Outgoing:\n",bencode2ascii(msg));
     }
 
     public void send_find_node(DHTtid tid, DHTId target, DHTProtocol want) {
@@ -3036,41 +2993,26 @@ class DHTNode {
 
 	ubyte[] blob = address.to_blob();
 	
-        auto msg = appender!(ubyte[])();
-        msg ~= part1;
-        msg ~= pinfo.myid.id[];
-        msg ~= part2;
-        msg ~= info_hash.id[];
-        msg ~= wantchoice[want];
-	msg ~= (blob.length == 6 ? "e2:ip6:".representation : "e2:ip18:".representation);
-        msg ~= blob;
-        msg ~= part3;
-        msg ~= tid.tid[];
-        msg ~= part4;
+        enum string msg_code = 
+            addDict!(""
+                ~addKeyDict!("a",""
+	            ~addKeyStringExp!("id","pinfo.myid.id")
+	            ~addKeyStringExp!("info_hash","info_hash.id")
+		    ~addRawExp!("wantchoice[want]")
+	        )
+	        ~addKeyString!("ip",blob)
+	        ~addKeyString!("q","get_peers")
+	        ~addKeyStringExp!("t","tid.tid")
+	        ~addKeyString!("y","q")
+            );
 
-        pinfo.s.sendTo(msg.data, cast(SocketFlags) 0, address);
+	ubyte[] msg = mixin(BEncodeHead ~ msg_code ~ BEncodeTail);
+	    
+        pinfo.s.sendTo(msg, cast(SocketFlags) 0, address);
         version (statistics)
-            update_statistics(pinfo, msg.data.length);
-	version(protocol_trace){
-	    fLog.info("Outgoing:\n",bencode2ascii(msg.data));
-            enum string msg_code = 
-                addDict!(""
-                    ~addKeyDict!("a",""
-	                ~addKeyStringExp!("id","pinfo.myid.id")
-	                ~addKeyStringExp!("info_hash","info_hash.id")
-			~addRawExp!("wantchoice[want]")
-	            )
-	            ~addKeyString!("ip",blob)
-	            ~addKeyString!("q","get_peers")
-	            ~addKeyStringExp!("t","tid.tid")
-	            ~addKeyString!("y","q")
-                );
-
-	    if(mixin(BEncodeHead ~ msg_code ~ BEncodeTail) == msg.data)
-                fLog.info("OK, old and new message are identical.");
-            else
-                fLog.info("BROKEN, old and new message are NOT identical.","\nold/new:\n",to_ascii(msg.data,true),"\n",to_ascii(mixin(BEncodeHead ~ msg_code ~ BEncodeTail),true),"\n\nMixin:\n",BEncodeHead ~ msg_code ~ BEncodeTail);
-	}
+            update_statistics(pinfo, msg.length);
+	version(protocol_trace)
+	    fLog.info("Outgoing:\n",bencode2ascii(msg));
     }
 
     public alias send_closest_nodes = send_nodes_peers; // identical
@@ -3094,90 +3036,53 @@ class DHTNode {
         if (want & DHTProtocol.want6)
             nodes6 = DHT.get_instance.gather_closest_nodes_for_reply(&DHT.info6, target, 8);
 
-        static const ubyte[] part0 = "d2:ip".representation;
-        static const ubyte[] part1 = "1:rd2:id20:".representation;
-        static const ubyte[] part2 = "6:valuesl".representation;
-        static const ubyte[] part3 = "e".representation;
-        static const ubyte[] part4 = "1:y1:re".representation;
-
-        auto msg = appender!(ubyte[])();
-
-        msg ~= part0;
-	msg ~= (blob.length == 6 ? "6:".representation : "18:".representation);
-        msg ~= blob;
-	
-	
-        msg ~= part1;
-        msg ~= pinfo.myid.id[];
-        if (nodes.length > 0) {
-            msg ~= cast(ubyte[])("5:nodes" ~ to!string(nodes.length) ~ ":");
-            msg ~= nodes;
-        }
-        if (nodes6.length > 0) {
-            msg ~= cast(ubyte[])("6:nodes6" ~ to!string(nodes6.length) ~ ":");
-            msg ~= nodes6;
-        }
-        if (token.length > 0) {
-            msg ~= cast(ubyte[])("5:token" ~ to!string(token.length) ~ ":");
-            msg ~= token;
-        }
+	// All entries are the same size, so we're building the list manually
 	ubyte[] peersarr;
         if (peers.length > 0) {
-            ushort entrylen = pinfo.is_v6 ? 18 : 6;
-            ubyte[] len_header = cast(ubyte[]) to!string(entrylen) ~ ':';
+            ushort entrylen;
+            ubyte[] len_header;
+	    if(pinfo.is_v6){
+	        entrylen = 18;
+		len_header = cast(ubyte[]) "18:";
+	    } else {
+	        entrylen = 6;
+		len_header = cast(ubyte[]) "6:";
+            }	
+	
             peersarr.reserve(256);
 	    
             fLog.info(
                 "  Sent " ~ to!string(peers.length / entrylen) ~ " " ~ (pinfo.is_v6 ? "IPV6"
                 : "IPV4") ~ " peers");
 
-            msg ~= part2;
-
             while (peers.length > 0) {
-                msg ~= len_header;
-                msg ~= peers[0 .. entrylen];
                 peersarr ~= len_header;
                 peersarr ~= peers[0 .. entrylen];
-
                 peers = peers[entrylen .. $];
             }
+        }	    
+	    
+        enum string msg_code = 
+            addDict!(""
+	        ~addKeyString!("ip",blob)
+                ~addKeyDict!("r",""
+	            ~addKeyStringExp!("id","pinfo.myid.id")
+		    ~addIf!("nodes.length > 0",addKeyString!("nodes",nodes))
+		    ~addIf!("nodes6.length > 0",addKeyString!("nodes6",nodes6))
+		    ~addIf!("token.length > 0",addKeyString!("token",token))
+		    ~addIf!("peersarr.length > 0",addString!("values")~addRaw!("l")~addRaw!(peersarr)~addRaw!("e"))
+	        )
+	        ~addKeyString!("t",tid)
+	        ~addKeyString!("y","r")
+            );
 
-            msg ~= part3;
-        }
-
-        msg ~= cast(ubyte[])("e1:t" ~ to!string(tid.length) ~ ":");
-        msg ~= tid;
-        msg ~= part4;
-
-        fLog.info(
-            "  Sent (" ~ to!string(nodes.length / 26) ~ "+" ~ to!string(nodes6.length / 38) ~ ") nodes");
-
-        pinfo.s.sendTo(msg.data, cast(SocketFlags) 0, address);
+	ubyte[] msg = mixin(BEncodeHead ~ msg_code ~ BEncodeTail);
+	
+        pinfo.s.sendTo(msg, cast(SocketFlags) 0, address);
         version (statistics)
-            update_statistics(pinfo, msg.data.length);
-	version(protocol_trace){
-	    fLog.info("Outgoing:\n",bencode2ascii(msg.data));
-
-            enum string msg_code = 
-                addDict!(""
-	            ~addKeyString!("ip",blob)
-                    ~addKeyDict!("r",""
-	                ~addKeyStringExp!("id","pinfo.myid.id")
-			~addIf!("nodes.length > 0",addKeyString!("nodes",nodes))
-			~addIf!("nodes6.length > 0",addKeyString!("nodes6",nodes6))
-			~addIf!("token.length > 0",addKeyString!("token",token))
-			~addIf!("peersarr.length > 0",addString!("values")~addRaw!("l")~addRaw!(peersarr)~addRaw!("e"))
-	            )
-	            ~addKeyString!("t",tid)
-	            ~addKeyString!("y","r")
-                );
-
-		
-	    if(mixin(BEncodeHead ~ msg_code ~ BEncodeTail) == msg.data)
-                fLog.info("OK, old and new message are identical.");
-            else
-                fLog.info("BROKEN, old and new message are NOT identical.","\nold/new:\n",to_ascii(msg.data,true),"\n",to_ascii(mixin(BEncodeHead ~ msg_code ~ BEncodeTail),true),"\n\nMixin:\n",BEncodeHead ~ msg_code ~ BEncodeTail);
-	}
+            update_statistics(pinfo, msg.length);
+	version(protocol_trace)
+	    fLog.info("Outgoing:\n",bencode2ascii(msg));
     }
 
     version (statistics) {
@@ -3212,55 +3117,24 @@ class DHTNode {
     public alias send_pong = send_peer_announced;
 
     public static void send_peer_announced(DHT.DHTInfo* pinfo, Address address, ubyte[] tid) {
-        static const ubyte[] part0 = "d2:ip".representation;
-        static const ubyte[] part1 = "1:rd2:id20:".representation;
-        static const ubyte[] part2 = "1:y1:re".representation;
-        auto msg = appender!(ubyte[])();
-
 	ubyte[] blob = address.to_blob();
+        enum string msg_code = 
+            addDict!(""
+	        ~addKeyString!("ip",blob)
+                ~addKeyDict!("r",
+	            addKeyStringExp!("id","pinfo.myid.id") // ...Exp for quoted expressions
+	        )
+	        ~addKeyString!("t",tid)
+	        ~addKeyString!("y","r")
+            );
 
-        msg ~= part0;
-	msg ~= cast(ubyte[]) to!string(blob.length);
-	msg ~= ':';
-        msg ~= blob;
+	ubyte[] msg = mixin(BEncodeHead ~ msg_code ~ BEncodeTail);
 	
-        msg ~= part1;
-        msg ~= pinfo.myid.id[];
-
-        msg ~= cast(ubyte[])("e1:t" ~ to!string(tid.length) ~ ":");
-        msg ~= tid;
-        msg ~= part2;
-
-        pinfo.s.sendTo(msg.data, cast(SocketFlags) 0, address);
+        pinfo.s.sendTo(msg, cast(SocketFlags) 0, address);
         version (statistics)
-            update_statistics(pinfo, msg.data.length);
-	version(protocol_trace){
-	    fLog.info("Outgoing_old:\n",to_ascii(msg.data,true));
-	    fLog.info("Outgoing_old:\n",bencode2ascii(msg.data));
-            enum string msg_code = 
-                addDict!(""
-	            ~addKeyString!("ip",blob)
-                    ~addKeyDict!("r",
-	                addKeyStringExp!("id","pinfo.myid.id") // ...Exp for quoted expressions
-	            )
-	            ~addKeyString!("t",tid)
-	            ~addKeyString!("y","r")
-                );
-
-	    if(mixin(BEncodeHead ~ msg_code ~ BEncodeTail) == msg.data)
-                fLog.info("OK, old and new message are identical.");
-            else
-                fLog.info("BROKEN, old and new message are NOT identical.","\nold/new:\n",to_ascii(msg.data,true),"\n",to_ascii(mixin(BEncodeHead ~ msg_code ~ BEncodeTail),true),"\n\nMixin:\n",BEncodeHead ~ msg_code ~ BEncodeTail);
-	    
-		
-	    //template say(string s){
-		//enum string say = s ~ " Compiles=" ~ (__traits(compiles,mixin(s)) ? "true" : "false") ~ (__traits(compiles,mixin(s)) ? " = " ~ mixin(s) : "");
-	    //}
-	    //pragma(msg,say!`addString!("jaja")`);
-
-
-	    
-	}
+            update_statistics(pinfo, msg.length);
+	version(protocol_trace)
+	    fLog.info("Outgoing:\n",bencode2ascii(msg));
     }
 
     public void pinged() {
